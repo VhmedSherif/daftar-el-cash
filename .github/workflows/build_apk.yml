@@ -34,7 +34,8 @@ jobs:
           python3 -c "import PIL" 2>/devnull || sudo apt-get update && sudo apt-get install -y python3-pil
           python3 -c '
           import base64, io, os
-          from PIL import Image
+          from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
           p = "app_build/android/app/src/main/AndroidManifest.xml"
           s = open(p, encoding="utf-8").read()
