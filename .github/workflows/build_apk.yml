@@ -26,54 +26,81 @@ jobs:
         with:
           channel: 'stable'
 
-      - name: Create Android Project, Inject App Code & Custom Icon
+      - name: Create Android Project, Set Arabic Name & Custom Icon
         run: |
           flutter create --platforms=android --org com.daftarelcash.app --project-name daftar_el_cash app_build
           cp main.dart app_build/lib/main.dart
           rm -f app_build/test/widget_test.dart
-          python3 -c "import PIL" 2>/devnull || sudo apt-get update && sudo apt-get install -y python3-pil
-          python3 -c '
-          import base64, io, os
-          from PIL import Image, ImageFile
-ImageFile.LOAD_TRUNCATED_IMAGES = True
+          python3 -c "import PIL" 2>/dev/null || (sudo apt-get update && sudo apt-get install -y python3-pil)
+          cat << 'PY' > make_icons.py
+          import os
+          from PIL import Image, ImageDraw
 
           p = "app_build/android/app/src/main/AndroidManifest.xml"
           s = open(p, encoding="utf-8").read()
-          s = s.replace("android:label=\"daftar_el_cash\"", "android:label=\"دفتر الكاش\"")
+          s = s.replace('android:label="daftar_el_cash"', 'android:label="\u062f\u0641\u062a\u0631 \u0627\u0644\u0643\u0627\u0634"')
           open(p, "w", encoding="utf-8").write(s)
 
-          raw = open("icon.b64", encoding="utf-8").read()
-          data = base64.b64decode("".join(raw.split()))
-          src = Image.open(io.BytesIO(data)).convert("RGBA")
+          S = 1024
+          im = Image.new("RGB", (S, S), (15, 118, 110))
+          px = im.load()
+          for y in range(S):
+              t = y / float(S - 1)
+              c = (int(18 * (1 - t) + 9 * t), int(132 * (1 - t) + 84 * t), int(120 * (1 - t) + 77 * t))
+              for x in range(S):
+                  px[x, y] = c
+
+          d = ImageDraw.Draw(im)
+          d.rounded_rectangle([266, 234, 666, 764], radius=64, fill=(7, 64, 58))
+          d.rounded_rectangle([396, 454, 734, 714], radius=52, fill=(7, 64, 58))
+          d.rounded_rectangle([250, 215, 650, 745], radius=60, fill=(212, 154, 58))
+          d.rounded_rectangle([312, 215, 645, 680], radius=48, fill=(248, 250, 252))
+          d.rectangle([302, 215, 318, 685], fill=(168, 112, 32))
+          d.rectangle([558, 215, 588, 395], fill=(224, 168, 72))
+          d.rounded_rectangle([282, 675, 632, 722], radius=22, fill=(226, 232, 240))
+          d.polygon([(335, 705), (378, 705), (378, 775), (356, 756), (335, 775)], fill=(230, 174, 76))
+
+          pts = [(455, 457), (555, 357), (598, 400), (702, 296)]
+          d.line(pts, fill=(238, 182, 82), width=42, joint="curve")
+          d.polygon([(655, 258), (772, 240), (754, 357)], fill=(238, 182, 82))
+
+          d.rounded_rectangle([382, 430, 715, 695], radius=48, fill=(13, 98, 90))
+          d.rounded_rectangle([398, 446, 705, 685], radius=42, fill=(248, 250, 252))
+          d.rounded_rectangle([398, 446, 556, 685], radius=42, fill=(222, 166, 70))
+          d.rectangle([490, 446, 556, 685], fill=(222, 166, 70))
+          d.rounded_rectangle([608, 530, 730, 606], radius=34, fill=(13, 98, 90))
+          d.rounded_rectangle([620, 542, 728, 594], radius=24, fill=(232, 178, 82))
+          d.ellipse([636, 555, 662, 581], fill=(162, 108, 30))
+
           res_dir = "app_build/android/app/src/main/res"
           resample = getattr(Image, "Resampling", Image).LANCZOS
-          bg_rgb = src.getpixel((src.width // 2, 4))[:3]
-          bg_hex = "#{:02X}{:02X}{:02X}".format(*bg_rgb)
+          bg_rgb = (15, 114, 104)
 
-          for folder, legacy_sz, fg_sz in [
+          for folder, lsz, fsz in [
               ("mipmap-mdpi", 48, 108),
               ("mipmap-hdpi", 72, 162),
               ("mipmap-xhdpi", 96, 216),
               ("mipmap-xxhdpi", 144, 324),
               ("mipmap-xxxhdpi", 192, 432),
           ]:
-              dpath = os.path.join(res_dir, folder)
-              os.makedirs(dpath, exist_ok=True)
-              src.resize((legacy_sz, legacy_sz), resample).save(os.path.join(dpath, "ic_launcher.png"), format="PNG")
-              fg = Image.new("RGBA", (fg_sz, fg_sz), (*bg_rgb, 255))
-              isz = int(round(fg_sz * 0.80))
-              fg.paste(src.resize((isz, isz), resample), ((fg_sz - isz) // 2, (fg_sz - isz) // 2))
-              fg.save(os.path.join(dpath, "ic_launcher_fg.png"), format="PNG")
+              dp = os.path.join(res_dir, folder)
+              os.makedirs(dp, exist_ok=True)
+              im.resize((lsz, lsz), resample).save(os.path.join(dp, "ic_launcher.png"), format="PNG")
+              fg = Image.new("RGB", (fsz, fsz), bg_rgb)
+              isz = int(round(fsz * 0.78))
+              fg.paste(im.resize((isz, isz), resample), ((fsz - isz) // 2, (fsz - isz) // 2))
+              fg.save(os.path.join(dp, "ic_launcher_fg.png"), format="PNG")
 
           os.makedirs(os.path.join(res_dir, "values"), exist_ok=True)
           open(os.path.join(res_dir, "values", "ic_launcher_bg.xml"), "w", encoding="utf-8").write(
-              f"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<resources>\n  <color name=\"ic_launcher_bg\">{bg_hex}</color>\n</resources>\n"
+              '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n  <color name="ic_launcher_bg">#0F7268</color>\n</resources>\n'
           )
           os.makedirs(os.path.join(res_dir, "mipmap-anydpi-v26"), exist_ok=True)
           open(os.path.join(res_dir, "mipmap-anydpi-v26", "ic_launcher.xml"), "w", encoding="utf-8").write(
-              "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<adaptive-icon xmlns:android=\"http://schemas.android.com/apk/res/android\">\n  <background android:drawable=\"@color/ic_launcher_bg\"/>\n  <foreground android:drawable=\"@mipmap/ic_launcher_fg\"/>\n</adaptive-icon>\n"
+              '<?xml version="1.0" encoding="utf-8"?>\n<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n  <background android:drawable="@color/ic_launcher_bg"/>\n  <foreground android:drawable="@mipmap/ic_launcher_fg"/>\n</adaptive-icon>\n'
           )
-          '
+          PY
+          python3 make_icons.py
 
       - name: Install Dependencies & Build Release APK
         working-directory: app_build
@@ -93,5 +120,5 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
         continue-on-error: true
         with:
           tag_name: v1.0.${{ github.run_number }}
-          name: "دفتر الكاش APK بالأيقونة المخصصة (إصدار #${{ github.run_number }})"
+          name: "\u062f\u0641\u062a\u0631 \u0627\u0644\u0643\u0627\u0634 APK \u0628\u0627\u0644\u0623\u064a\u0642\u0648\u0646\u0629 \u0627\u0644\u0645\u062e\u0635\u0635\u0629 (\u0625\u0635\u062f\u0627\u0631 #${{ github.run_number }})"
           files: daftar-el-cash.apk
