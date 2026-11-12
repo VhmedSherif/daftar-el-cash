@@ -26,16 +26,52 @@ jobs:
         with:
           channel: 'stable'
 
-      - name: Create Android Project & Inject App Code
+      - name: Create Android Project, Inject App Code & Custom Icon
         run: |
           flutter create --platforms=android --org com.daftarelcash.app --project-name daftar_el_cash app_build
           cp main.dart app_build/lib/main.dart
           rm -f app_build/test/widget_test.dart
+          python3 -c "import PIL" 2>/devnull || sudo apt-get update && sudo apt-get install -y python3-pil
           python3 -c '
+          import base64, io, os
+          from PIL import Image
+
           p = "app_build/android/app/src/main/AndroidManifest.xml"
           s = open(p, encoding="utf-8").read()
           s = s.replace("android:label=\"daftar_el_cash\"", "android:label=\"دفتر الكاش\"")
           open(p, "w", encoding="utf-8").write(s)
+
+          raw = open("icon.b64", encoding="utf-8").read()
+          data = base64.b64decode("".join(raw.split()))
+          src = Image.open(io.BytesIO(data)).convert("RGBA")
+          res_dir = "app_build/android/app/src/main/res"
+          resample = getattr(Image, "Resampling", Image).LANCZOS
+          bg_rgb = src.getpixel((src.width // 2, 4))[:3]
+          bg_hex = "#{:02X}{:02X}{:02X}".format(*bg_rgb)
+
+          for folder, legacy_sz, fg_sz in [
+              ("mipmap-mdpi", 48, 108),
+              ("mipmap-hdpi", 72, 162),
+              ("mipmap-xhdpi", 96, 216),
+              ("mipmap-xxhdpi", 144, 324),
+              ("mipmap-xxxhdpi", 192, 432),
+          ]:
+              dpath = os.path.join(res_dir, folder)
+              os.makedirs(dpath, exist_ok=True)
+              src.resize((legacy_sz, legacy_sz), resample).save(os.path.join(dpath, "ic_launcher.png"), format="PNG")
+              fg = Image.new("RGBA", (fg_sz, fg_sz), (*bg_rgb, 255))
+              isz = int(round(fg_sz * 0.80))
+              fg.paste(src.resize((isz, isz), resample), ((fg_sz - isz) // 2, (fg_sz - isz) // 2))
+              fg.save(os.path.join(dpath, "ic_launcher_fg.png"), format="PNG")
+
+          os.makedirs(os.path.join(res_dir, "values"), exist_ok=True)
+          open(os.path.join(res_dir, "values", "ic_launcher_bg.xml"), "w", encoding="utf-8").write(
+              f"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<resources>\n  <color name=\"ic_launcher_bg\">{bg_hex}</color>\n</resources>\n"
+          )
+          os.makedirs(os.path.join(res_dir, "mipmap-anydpi-v26"), exist_ok=True)
+          open(os.path.join(res_dir, "mipmap-anydpi-v26", "ic_launcher.xml"), "w", encoding="utf-8").write(
+              "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<adaptive-icon xmlns:android=\"http://schemas.android.com/apk/res/android\">\n  <background android:drawable=\"@color/ic_launcher_bg\"/>\n  <foreground android:drawable=\"@mipmap/ic_launcher_fg\"/>\n</adaptive-icon>\n"
+          )
           '
 
       - name: Install Dependencies & Build Release APK
@@ -56,5 +92,5 @@ jobs:
         continue-on-error: true
         with:
           tag_name: v1.0.${{ github.run_number }}
-          name: "دفتر الكاش APK (إصدار #${{ github.run_number }})"
+          name: "دفتر الكاش APK بالأيقونة المخصصة (إصدار #${{ github.run_number }})"
           files: daftar-el-cash.apk
