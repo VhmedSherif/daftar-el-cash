@@ -105,7 +105,7 @@ jobs:
       - name: Install Dependencies & Build Release APK
         working-directory: app_build
         run: |
-          flutter pub add sqflite path
+          flutter pub add sqflite path url_launcher
           flutter build apk --release --no-tree-shake-icons
           cp build/app/outputs/flutter-apk/app-release.apk ../daftar-el-cash.apk
 
