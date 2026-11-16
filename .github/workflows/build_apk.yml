@@ -31,6 +31,7 @@ jobs:
           flutter create --platforms=android --org com.daftarelcash.app --project-name daftar_el_cash app_build
           cp main.dart app_build/lib/main.dart
           rm -f app_build/test/widget_test.dart
+          cp app_test.dart app_build/test/app_test.dart
           python3 -c "import PIL" 2>/dev/null || (sudo apt-get update && sudo apt-get install -y python3-pil)
           cat << 'PY' > make_icons.py
           import os
@@ -106,6 +107,8 @@ jobs:
         working-directory: app_build
         run: |
           flutter pub add sqflite path url_launcher
+          flutter analyze --no-fatal-infos --no-fatal-warnings
+          flutter test
           flutter build apk --release --no-tree-shake-icons
           cp build/app/outputs/flutter-apk/app-release.apk ../daftar-el-cash.apk
 
