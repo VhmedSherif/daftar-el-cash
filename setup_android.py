@@ -15,7 +15,7 @@ ms = open(manifest_path, encoding="utf-8").read()
 ms = ms.replace('android:label="daftar_el_cash"', 'android:label="دفتر الكاش"')
 open(manifest_path, "w", encoding="utf-8").write(ms)
 
-# 3. Inject Native Android File Backup/Restore & Share MethodChannel into MainActivity.kt
+# 3. Inject Native Android File Backup/Restore (.json + raw SQLite .db) & Share MethodChannel
 kt_files = glob.glob("app_build/android/app/src/main/**/MainActivity.kt", recursive=True)
 assert kt_files, "MainActivity.kt not found!"
 kt_path = kt_files[0]
@@ -29,6 +29,7 @@ import android.content.Intent
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import java.io.File
 
 class MainActivity : FlutterActivity() {{
     private var pendingResult: MethodChannel.Result? = null
@@ -106,8 +107,16 @@ class MainActivity : FlutterActivity() {{
             pendingResult = null
             if (resultCode == Activity.RESULT_OK && data?.data != null) {{
                 try {{
-                    val text = contentResolver.openInputStream(data.data!!)?.bufferedReader(Charsets.UTF_8)?.use {{ it.readText() }}
-                    res?.success(text)
+                    val bytes = contentResolver.openInputStream(data.data!!)?.use {{ it.readBytes() }}
+                    if (bytes == null) {{
+                        res?.success(null)
+                    }} else if (bytes.size >= 16 && String(bytes, 0, 15, Charsets.US_ASCII) == "SQLite format 3") {{
+                        val tmp = File(cacheDir, "import_legacy_${{System.currentTimeMillis()}}.db")
+                        tmp.writeBytes(bytes)
+                        res?.success("__SQLITE_FILE__:${{tmp.absolutePath}}")
+                    }} else {{
+                        res?.success(String(bytes, Charsets.UTF_8))
+                    }}
                 }} catch (e: Exception) {{
                     res?.error("READ_ERR", e.message, null)
                 }}
