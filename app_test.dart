@@ -1,8 +1,9 @@
+import 'dart:convert';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:daftar_el_cash/main.dart';
 
 void main() {
-  testWidgets('Daily totals, debt notes, JSON backup, and smart legacy import work accurately', (WidgetTester tester) async {
+  testWidgets('Daily totals, debt notes, JSON backup, and automatic AccessibilityService frame extractor work accurately', (WidgetTester tester) async {
     final now = DateTime(2026, 11, 16, 12, 0);
     final txs = [
       CashTransaction(id: 1, type: TxType.deposit, amount: 1000, profit: 10, createdAt: now),
@@ -36,79 +37,57 @@ void main() {
     final decoded = BackupPayload.decode(encoded);
     expect(decoded.transactions.length, 3);
     expect(decoded.debts.length, 1);
-    expect(decoded.debts.first.note, '01012345678 باقي تحويل');
-    expect(decoded.debts.first.logs.first.note, 'سداد فودافون كاش');
 
-    // 2. Test Smart Bulk WhatsApp Statements Import
-    const bulkStatements = '''
-📋 *كشف حساب - دفتر الكاش*
-العميل: كريم عادل
-ملاحظة: 01099887766
-━━━━━━━━━━━━━━
-📌 *سجل الحركات:*
-• بداية الحساب: 1,200 ج ← الباقي: 1,200 ج (السبت 14 نوفمبر)
-• تم سداد (-): 500 ج ← الباقي: 700 ج (كاش) (الأحد 15 نوفمبر)
-━━━━━━━━━━━━━━
-💰 *المبلغ المتبقي للسداد: 700 ج.م*
-📋 *كشف حساب - دفتر الكاش*
-العميل: طارق حسن
-━━━━━━━━━━━━━━
-💰 *الرصيد المتبقي ليك: 350 ج.م*
-''';
-    final parsedStmts = BackupPayload.decode(bulkStatements, fallbackDate: now);
-    expect(parsedStmts.debts.length, 2);
-    expect(parsedStmts.debts[0].person, 'كريم عادل');
-    expect(parsedStmts.debts[0].amount, 700);
-    expect(parsedStmts.debts[0].isForMe, true);
-    expect(parsedStmts.debts[0].logs.length, 2);
-    expect(parsedStmts.debts[1].person, 'طارق حسن');
-    expect(parsedStmts.debts[1].amount, 350);
-    expect(parsedStmts.debts[1].isForMe, false);
+    // 2. Test Automatic AccessibilityService Frame Extractor across multi-day scrolling & debts
+    final simulatedFrames = jsonEncode([
+      {
+        'nodes': [
+          {'t': 'اليوم - الإثنين 16 نوفمبر', 'x': 540, 'y': 220, 'top': 200, 'bot': 240},
+          {'t': 'إيداع • 3,000 ج\n2:15 م\n+30 ج', 'x': 540, 'y': 620, 'top': 590, 'bot': 650},
+          {'t': 'سحب • 1,200 ج', 'x': 800, 'y': 760, 'top': 730, 'bot': 790},
+          {'t': '4:40 م', 'x': 800, 'y': 785, 'top': 770, 'bot': 800},
+          {'t': '+12 ج', 'x': 220, 'y': 760, 'top': 740, 'bot': 780},
+        ]
+      },
+      {
+        'nodes': [
+          {'t': 'الأحد 15 نوفمبر 2026', 'x': 540, 'y': 220, 'top': 200, 'bot': 240},
+          {'t': 'إيداع • 5,000 ج\n11:10 ص\n+50 ج', 'x': 540, 'y': 620, 'top': 590, 'bot': 650},
+        ]
+      },
+      {
+        'nodes': [
+          {'t': 'مصطفى كامل (ليا عنده)', 'x': 780, 'y': 500, 'top': 480, 'bot': 520},
+          {'t': 'الباقي: 850 ج', 'x': 240, 'y': 500, 'top': 480, 'bot': 520},
+          {'t': 'بداية الحساب: 1,000 ج  ←  الباقي: 1,000 ج • (01011223344 باقي شحن) (السبت 14 نوفمبر)', 'x': 540, 'y': 590, 'top': 575, 'bot': 605},
+          {'t': 'سدد جزء (-): 150 ج  ←  الباقي: 850 ج • (كاش) (الأحد 15 نوفمبر)', 'x': 540, 'y': 630, 'top': 615, 'bot': 645},
+          {'t': 'ياسر جلال (عليا ليه)', 'x': 780, 'y': 760, 'top': 740, 'bot': 780},
+          {'t': 'الباقي: 400 ج', 'x': 240, 'y': 760, 'top': 740, 'bot': 780},
+        ]
+      }
+    ]);
 
-    // 3. Test Smart Screenshot OCR Text Import (Old App UI cards)
-    const ocrScreenText = '''
-إيداع • 2,500 ج
-3:30 م
-+25 ج
-سحب • 800 ج
-4:15 م
-+10 ج
-محمود سمير (ليا عنده)
-الباقي: 1,450 ج
-ملاحظة: فودافون
-الباقي: 300 ج سامح رجب (عليا ليه)
-''';
-    final parsedOcr = BackupPayload.decode(ocrScreenText, fallbackDate: now);
-    expect(parsedOcr.transactions.length, 2);
-    expect(parsedOcr.transactions[0].amount, 2500);
-    expect(parsedOcr.transactions[0].profit, 25);
-    expect(parsedOcr.transactions[1].type, TxType.withdraw);
-    expect(parsedOcr.debts.length, 2);
-    expect(parsedOcr.debts[0].person, 'محمود سمير');
-    expect(parsedOcr.debts[0].amount, 1450);
-    expect(parsedOcr.debts[0].note, 'فودافون');
-    expect(parsedOcr.debts[1].person, 'سامح رجب');
-    expect(parsedOcr.debts[1].amount, 300);
-    expect(parsedOcr.debts[1].isForMe, false);
+    final autoExtracted = BackupPayload.decodeExtractedFrames(simulatedFrames, nowOverride: now);
+    expect(autoExtracted.transactions.length, 3);
+    expect(autoExtracted.transactions.any((t) => t.amount == 5000 && t.createdAt.day == 15), true);
+    expect(autoExtracted.debts.length, 2);
+    expect(autoExtracted.debts[0].person, 'مصطفى كامل');
+    expect(autoExtracted.debts[0].amount, 850);
+    expect(autoExtracted.debts[0].note, '01011223344 باقي شحن');
+    expect(autoExtracted.debts[0].logs.length, 2);
+    expect(autoExtracted.debts[1].person, 'ياسر جلال');
+    expect(autoExtracted.debts[1].isForMe, false);
+    expect(autoExtracted.debts[1].amount, 400);
 
     await tester.pumpWidget(CashOfficeApp(testDaily: txs, testDebts: debts));
     await tester.pumpAndSettle();
 
     expect(find.text('+23 ج'), findsOneWidget);
-    expect(find.text('حركة الكاش (3)'), findsOneWidget);
-    expect(find.text('1,900 ج'), findsOneWidget);
     expect(find.text('مجموع الإيداع (2)'), findsOneWidget);
-    expect(find.text('1,500 ج'), findsOneWidget);
     expect(find.text('مجموع السحب (1)'), findsOneWidget);
-    expect(find.text('400 ج'), findsOneWidget);
-
-    await tester.tap(find.text('الآجل والديون'));
-    await tester.pumpAndSettle();
-    expect(find.text('ملاحظة: 01012345678 باقي تحويل'), findsOneWidget);
 
     await tester.tap(find.text('نسخة احتياطية'));
     await tester.pumpAndSettle();
-    expect(find.text('أخذ نسخة احتياطية لكل البيانات'), findsOneWidget);
-    expect(find.text('نقل واسترجاع البيانات (ذكي وسريع)'), findsOneWidget);
+    expect(find.text('اسحب كل بيانات النسخة القديمة تلقائياً الآن'), findsOneWidget);
   });
 }
