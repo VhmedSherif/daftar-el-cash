@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
@@ -60,13 +61,17 @@ class CashTransaction {
     'month_key': Fmt.toMonthKey(createdAt),
     'created_at': createdAt.toIso8601String(),
   };
-  factory CashTransaction.fromMap(Map<String, Object?> m) => CashTransaction(
-    id: m['id'] as int?,
-    type: TxType.fromCode((m['type'] as String?) ?? 'deposit'),
-    amount: ((m['amount'] as num?) ?? 0).toDouble(),
-    profit: ((m['profit'] as num?) ?? 0).toDouble(),
-    createdAt: DateTime.tryParse((m['created_at'] as String?) ?? '') ?? DateTime.now(),
-  );
+  factory CashTransaction.fromMap(Map<String, Object?> m) {
+    final dtStr = (m['created_at'] ?? m['createdAt'] ?? '') as String;
+    final dt = DateTime.tryParse(dtStr) ?? DateTime.now();
+    return CashTransaction(
+      id: m['id'] as int?,
+      type: TxType.fromCode(((m['type'] as String?) ?? 'deposit')),
+      amount: ((m['amount'] as num?) ?? 0).toDouble(),
+      profit: ((m['profit'] as num?) ?? 0).toDouble(),
+      createdAt: dt,
+    );
+  }
 }
 
 class DebtLogEntry {
@@ -75,24 +80,106 @@ class DebtLogEntry {
   final String kind, note;
   final double delta, balanceAfter;
   final DateTime createdAt;
+  Map<String, Object?> toJsonMap() => {
+    'kind': kind,
+    'delta': delta,
+    'balance_after': balanceAfter,
+    'note': note,
+    'created_at': createdAt.toIso8601String(),
+  };
   factory DebtLogEntry.fromMap(Map<String, Object?> m) => DebtLogEntry(
     debtId: ((m['debt_id'] as num?) ?? 0).toInt(),
     kind: (m['kind'] as String?) ?? 'init',
     delta: ((m['delta'] as num?) ?? 0).toDouble(),
-    balanceAfter: ((m['balance_after'] as num?) ?? 0).toDouble(),
+    balanceAfter: ((m['balance_after'] ?? m['balanceAfter'] ?? 0) as num).toDouble(),
     note: (m['note'] as String?) ?? '',
-    createdAt: DateTime.tryParse((m['created_at'] as String?) ?? '') ?? DateTime.now(),
+    createdAt: DateTime.tryParse(((m['created_at'] ?? m['createdAt'] ?? '') as String)) ?? DateTime.now(),
   );
 }
 
 class DebtAccount {
-  const DebtAccount({this.id, required this.person, required this.amount, required this.lastClearedAmount, required this.direction, required this.note, required this.settled, required this.logs});
+  const DebtAccount({this.id, required this.person, required this.amount, required this.lastClearedAmount, required this.direction, required this.note, required this.settled, required this.logs, this.updatedAt});
   final int? id;
   final String person, direction, note;
   final double amount, lastClearedAmount;
   final bool settled;
   final List<DebtLogEntry> logs;
+  final String? updatedAt;
   bool get isForMe => direction != 'on_me';
+
+  Map<String, Object?> toJsonMap() => {
+    'person': person,
+    'amount': amount,
+    'last_cleared': lastClearedAmount,
+    'direction': direction,
+    'note': note,
+    'settled': settled ? 1 : 0,
+    'updated_at': updatedAt ?? DateTime.now().toIso8601String(),
+    'logs': logs.map((l) => l.toJsonMap()).toList(),
+  };
+
+  factory DebtAccount.fromJsonMap(Map<String, Object?> m) {
+    final rawLogs = (m['logs'] ?? m['history']) as List<dynamic>? ?? const [];
+    final parsedLogs = rawLogs.whereType<Map>().map((e) => DebtLogEntry.fromMap(Map<String, Object?>.from(e))).toList();
+    final rawSettled = m['settled'];
+    final isSettled = rawSettled == true || rawSettled == 1;
+    return DebtAccount(
+      person: ((m['person'] as String?) ?? '').trim(),
+      amount: ((m['amount'] as num?) ?? 0).toDouble(),
+      lastClearedAmount: ((m['last_cleared'] ?? m['lastClearedAmount'] ?? m['originalAmount'] ?? 0) as num).toDouble(),
+      direction: (m['direction'] as String?) ?? 'for_me',
+      note: (m['note'] as String?) ?? '',
+      settled: isSettled,
+      updatedAt: (m['updated_at'] ?? m['createdAt']) as String?,
+      logs: parsedLogs,
+    );
+  }
+}
+
+class BackupPayload {
+  const BackupPayload({required this.transactions, required this.debts});
+  final List<CashTransaction> transactions;
+  final List<DebtAccount> debts;
+
+  static String encode({required List<CashTransaction> transactions, required List<DebtAccount> debts}) {
+    final map = {
+      'app': 'daftar_el_cash',
+      'version': 2,
+      'exported_at': DateTime.now().toIso8601String(),
+      'transactions': transactions.map((t) => t.toMap()).toList(),
+      'debts': debts.map((d) => d.toJsonMap()).toList(),
+    };
+    return const JsonEncoder.withIndent('  ').convert(map);
+  }
+
+  static BackupPayload decode(String rawJson) {
+    final cleaned = rawJson.replaceFirst('\uFEFF', '').trim();
+    if (cleaned.isEmpty) throw const FormatException('ملف النسخة الاحتياطية فارغ');
+    final decoded = jsonDecode(cleaned);
+    if (decoded is List) {
+      final txs = decoded.whereType<Map>().map((e) => CashTransaction.fromMap(Map<String, Object?>.from(e))).toList();
+      return BackupPayload(transactions: txs, debts: const []);
+    }
+    if (decoded is! Map) throw const FormatException('صيغة ملف النسخة الاحتياطية غير صحيحة');
+    final map = Map<String, Object?>.from(decoded);
+    if (!map.containsKey('transactions') && !map.containsKey('debts')) {
+      throw const FormatException('هذا الملف لا يحتوي على بيانات دفتر الكاش');
+    }
+    final rawTxs = (map['transactions'] as List<dynamic>?) ?? const [];
+    final rawDebts = (map['debts'] as List<dynamic>?) ?? const [];
+    final txs = rawTxs
+        .whereType<Map>()
+        .map((e) => Map<String, Object?>.from(e))
+        .where((e) => e['type'] == 'deposit' || e['type'] == 'withdraw')
+        .map(CashTransaction.fromMap)
+        .toList();
+    final debts = rawDebts
+        .whereType<Map>()
+        .map((e) => DebtAccount.fromJsonMap(Map<String, Object?>.from(e)))
+        .where((d) => d.person.isNotEmpty)
+        .toList();
+    return BackupPayload(transactions: txs, debts: debts);
+  }
 }
 
 class DailySummaryRow {
@@ -125,6 +212,11 @@ class CashDatabase {
 
   Future<List<CashTransaction>> getTxForDate(String dateKey) async {
     final rows = await (await database).query('transactions', where: 'date_key = ?', whereArgs: [dateKey], orderBy: 'id DESC');
+    return rows.map(CashTransaction.fromMap).toList();
+  }
+
+  Future<List<CashTransaction>> getAllTransactions() async {
+    final rows = await (await database).query('transactions', orderBy: 'id ASC');
     return rows.map(CashTransaction.fromMap).toList();
   }
 
@@ -165,9 +257,92 @@ class CashDatabase {
         direction: (m['direction'] as String?) ?? 'for_me',
         note: (m['note'] as String?) ?? '',
         settled: ((m['settled'] as num?) ?? 0) == 1,
+        updatedAt: m['updated_at'] as String?,
         logs: mapLogs[id] ?? const [],
       );
     }).toList();
+  }
+
+  Future<String> exportFullBackupJson() async {
+    final txs = await getAllTransactions();
+    final debts = await getAllDebts();
+    return BackupPayload.encode(transactions: txs, debts: debts);
+  }
+
+  Future<String> restoreBackupJson(String rawJson, {required bool replaceAll}) async {
+    final payload = BackupPayload.decode(rawJson);
+    final db = await database;
+    var addedTx = 0;
+    var addedDebts = 0;
+
+    await db.transaction((txn) async {
+      if (replaceAll) {
+        await txn.delete('debt_logs');
+        await txn.delete('debts');
+        await txn.delete('transactions');
+      }
+
+      for (final tx in payload.transactions) {
+        if (!replaceAll) {
+          final dup = await txn.query(
+            'transactions',
+            where: 'type = ? AND amount = ? AND profit = ? AND created_at = ?',
+            whereArgs: [tx.type.code, tx.amount, tx.profit, tx.createdAt.toIso8601String()],
+            limit: 1,
+          );
+          if (dup.isNotEmpty) continue;
+        }
+        await txn.insert('transactions', tx.toMap());
+        addedTx++;
+      }
+
+      for (final d in payload.debts) {
+        final upd = d.updatedAt ?? DateTime.now().toIso8601String();
+        if (!replaceAll) {
+          final dupD = await txn.query(
+            'debts',
+            where: 'person = ? AND direction = ? AND amount = ? AND settled = ?',
+            whereArgs: [d.person, d.direction, d.amount, d.settled ? 1 : 0],
+            limit: 1,
+          );
+          if (dupD.isNotEmpty) continue;
+        }
+        final newDebtId = await txn.insert('debts', {
+          'person': d.person,
+          'amount': d.amount,
+          'last_cleared': d.lastClearedAmount,
+          'direction': d.direction,
+          'note': d.note,
+          'settled': d.settled ? 1 : 0,
+          'updated_at': upd,
+        });
+        final logsChrono = d.logs.reversed.toList();
+        if (logsChrono.isEmpty) {
+          await txn.insert('debt_logs', {
+            'debt_id': newDebtId,
+            'kind': 'init',
+            'delta': d.amount,
+            'balance_after': d.settled ? 0.0 : d.amount,
+            'note': d.note.isEmpty ? 'بداية الحساب' : d.note,
+            'created_at': upd,
+          });
+        } else {
+          for (final l in logsChrono) {
+            await txn.insert('debt_logs', {
+              'debt_id': newDebtId,
+              'kind': l.kind,
+              'delta': l.delta,
+              'balance_after': l.balanceAfter,
+              'note': l.note,
+              'created_at': l.createdAt.toIso8601String(),
+            });
+          }
+        }
+        addedDebts++;
+      }
+    });
+
+    return 'تم استرجاع $addedTx معاملة و$addedDebts حساب آجل بنجاح';
   }
 
   Future<String> addOrMergeDebt(String person, double amount, String direction, String note) async {
@@ -287,6 +462,8 @@ class CashHomeScreen extends StatefulWidget {
 }
 
 class _CashHomeScreenState extends State<CashHomeScreen> {
+  static const _backupChannel = MethodChannel('daftar_el_cash/backup');
+
   int _tab = 0;
   TxType _type = TxType.deposit;
   DateTime _date = DateTime.now();
@@ -294,6 +471,7 @@ class _CashHomeScreenState extends State<CashHomeScreen> {
   final _amtCtrl = TextEditingController(), _profCtrl = TextEditingController();
   final _personCtrl = TextEditingController(), _debtAmtCtrl = TextEditingController(), _debtNoteCtrl = TextEditingController();
   String _debtDir = 'for_me', _debtFilter = 'unpaid', _debtSearch = '';
+  bool _replaceOnRestore = false;
   final Set<int> _expanded = {};
   List<CashTransaction> _daily = [];
   List<DebtAccount> _debts = [];
@@ -326,7 +504,103 @@ class _CashHomeScreenState extends State<CashHomeScreen> {
     if (!mounted) return;
     ScaffoldMessenger.of(context)
       ..clearSnackBars()
-      ..showSnackBar(SnackBar(content: Text(t), duration: const Duration(seconds: 2), behavior: SnackBarBehavior.floating));
+      ..showSnackBar(SnackBar(content: Text(t), duration: const Duration(seconds: 3), behavior: SnackBarBehavior.floating));
+  }
+
+  Future<void> _saveBackupToFile() async {
+    try {
+      final jsonStr = await CashDatabase.instance.exportFullBackupJson();
+      final fname = 'daftar_el_cash_backup_${Fmt.toDateKey(DateTime.now())}.json';
+      final saved = await _backupChannel.invokeMethod<bool>('saveBackupFile', {
+        'fileName': fname,
+        'content': jsonStr,
+      });
+      if (saved == true) {
+        _msg('تم حفظ ملف النسخة الاحتياطية بنجاح على جهازك');
+      }
+    } catch (e) {
+      _msg('تعذر حفظ الملف، يمكنك استخدام زر مشاركة أو نسخ النسخة الاحتياطية');
+    }
+  }
+
+  Future<void> _shareBackupExternal() async {
+    try {
+      final jsonStr = await CashDatabase.instance.exportFullBackupJson();
+      await Clipboard.setData(ClipboardData(text: jsonStr));
+      await _backupChannel.invokeMethod<bool>('shareText', {
+        'title': 'نسخة احتياطية - دفتر الكاش (${Fmt.toDateKey(DateTime.now())})',
+        'text': jsonStr,
+      });
+    } catch (_) {
+      final jsonStr = await CashDatabase.instance.exportFullBackupJson();
+      await Clipboard.setData(ClipboardData(text: jsonStr));
+      _msg('تم نسخ النسخة الاحتياطية في الحافظة');
+    }
+  }
+
+  Future<void> _copyBackupToClipboard() async {
+    final jsonStr = await CashDatabase.instance.exportFullBackupJson();
+    await Clipboard.setData(ClipboardData(text: jsonStr));
+    _msg('تم نسخ كود النسخة الاحتياطية بالكامل في الحافظة');
+  }
+
+  Future<void> _restoreFromFile() async {
+    try {
+      final content = await _backupChannel.invokeMethod<String>('pickBackupFile');
+      if (content == null || content.trim().isEmpty) return;
+      final res = await CashDatabase.instance.restoreBackupJson(content, replaceAll: _replaceOnRestore);
+      await _load();
+      _msg(res);
+    } on FormatException catch (fe) {
+      _msg(fe.message);
+    } catch (_) {
+      _msg('تأكد من اختيار ملف نسخة احتياطية صالح (.json)');
+    }
+  }
+
+  Future<void> _restoreFromClipboardDialog() async {
+    final pasteCtrl = TextEditingController();
+    final clip = await Clipboard.getData(Clipboard.kTextPlain);
+    if (clip?.text != null && clip!.text!.trim().isNotEmpty) {
+      pasteCtrl.text = clip.text!.trim();
+    }
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => Directionality(
+        textDirection: TextDirection.rtl,
+        child: AlertDialog(
+          title: const Text('استرجاع من نص النسخة الاحتياطية'),
+          content: TextField(
+            controller: pasteCtrl,
+            maxLines: 5,
+            decoration: const InputDecoration(
+              hintText: 'الصق كود النسخة الاحتياطية هنا...',
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('إلغاء')),
+            FilledButton(
+              onPressed: () async {
+                final raw = pasteCtrl.text.trim();
+                if (raw.isEmpty) return;
+                Navigator.of(ctx).pop();
+                try {
+                  final res = await CashDatabase.instance.restoreBackupJson(raw, replaceAll: _replaceOnRestore);
+                  await _load();
+                  _msg(res);
+                } on FormatException catch (fe) {
+                  _msg(fe.message);
+                } catch (_) {
+                  _msg('النص المنسوخ ليس نسخة احتياطية صالحة');
+                }
+              },
+              child: const Text('استرجاع الآن'),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   String _buildStatement(DebtAccount d) {
@@ -472,10 +746,22 @@ class _CashHomeScreenState extends State<CashHomeScreen> {
 
   @override
   Widget build(BuildContext context) {
-    const titles = ['دفتر الكاش', 'سجل الآجل والديون', 'جرد الأرباح الشهري'];
+    const titles = ['دفتر الكاش', 'سجل الآجل والديون', 'جرد الأرباح الشهري', 'النسخ الاحتياطي'];
     return Scaffold(
-      appBar: AppBar(backgroundColor: const Color(0xFF0F766E), foregroundColor: Colors.white, title: Text(titles[_tab], style: const TextStyle(fontWeight: FontWeight.bold))),
-      body: IndexedStack(index: _tab, children: [_buildDaily(), _buildDebts(), _buildMonthly()]),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF0F766E),
+        foregroundColor: Colors.white,
+        title: Text(titles[_tab], style: const TextStyle(fontWeight: FontWeight.bold)),
+        actions: [
+          if (_tab != 3)
+            IconButton(
+              tooltip: 'النسخ الاحتياطي',
+              onPressed: () => setState(() => _tab = 3),
+              icon: const Icon(Icons.backup_outlined),
+            ),
+        ],
+      ),
+      body: IndexedStack(index: _tab, children: [_buildDaily(), _buildDebts(), _buildMonthly(), _buildBackupTab()]),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _tab,
         onDestinationSelected: (i) => setState(() => _tab = i),
@@ -483,6 +769,7 @@ class _CashHomeScreenState extends State<CashHomeScreen> {
           NavigationDestination(icon: Icon(Icons.bolt_rounded), label: 'معاملات اليوم'),
           NavigationDestination(icon: Icon(Icons.people_alt_rounded), label: 'الآجل والديون'),
           NavigationDestination(icon: Icon(Icons.assessment_rounded), label: 'جرد الشهر'),
+          NavigationDestination(icon: Icon(Icons.backup_rounded), label: 'نسخة احتياطية'),
         ],
       ),
     );
@@ -743,6 +1030,87 @@ class _CashHomeScreenState extends State<CashHomeScreen> {
           subtitle: Text('${r.txCount} عملية • حركة: ${Fmt.money(r.totalVolume)} ج'),
           trailing: Text('+${Fmt.money(r.totalGain)} ج', style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF15803D))),
         ))),
+      ],
+    );
+  }
+
+  Widget _buildBackupTab() {
+    return ListView(
+      padding: const EdgeInsets.all(12),
+      children: [
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text('أخذ نسخة احتياطية لكل البيانات', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                const SizedBox(height: 4),
+                const Text('يحفظ جميع المعاملات اليومية، وجرد الشهور، وسجل الآجل والديون وحركات السداد بالكامل.', style: TextStyle(fontSize: 12.5, color: Color(0xFF64748B))),
+                const SizedBox(height: 12),
+                FilledButton.icon(
+                  style: FilledButton.styleFrom(backgroundColor: const Color(0xFF0F766E), padding: const EdgeInsets.symmetric(vertical: 12)),
+                  onPressed: _saveBackupToFile,
+                  icon: const Icon(Icons.save_alt_rounded),
+                  label: const Text('حفظ النسخة الاحتياطية كملف (.json) على التليفون', style: TextStyle(fontWeight: FontWeight.bold)),
+                ),
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 11)),
+                  onPressed: _shareBackupExternal,
+                  icon: const Icon(Icons.share_rounded),
+                  label: const Text('مشاركة النسخة (درايف / تيليجرام / واتساب)', style: TextStyle(fontWeight: FontWeight.bold)),
+                ),
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 11)),
+                  onPressed: _copyBackupToClipboard,
+                  icon: const Icon(Icons.copy_rounded),
+                  label: const Text('نسخ كود النسخة الاحتياطية في الحافظة', style: TextStyle(fontWeight: FontWeight.bold)),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 10),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text('استرجاع البيانات من نسخة احتياطية', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                const SizedBox(height: 8),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('استبدال البيانات الحالية بالكامل', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13.5)),
+                  subtitle: Text(
+                    _replaceOnRestore
+                        ? 'سيتم مسح المسجل حالياً واستبداله ببيانات النسخة المرفوعة'
+                        : 'وضع الدمج الآمن: يضيف بيانات النسخة فوق بياناتك الحالية بدون مسح أو تكرار',
+                    style: const TextStyle(fontSize: 12),
+                  ),
+                  value: _replaceOnRestore,
+                  onChanged: (v) => setState(() => _replaceOnRestore = v),
+                ),
+                const SizedBox(height: 8),
+                FilledButton.icon(
+                  style: FilledButton.styleFrom(backgroundColor: const Color(0xFF1D4ED8), padding: const EdgeInsets.symmetric(vertical: 12)),
+                  onPressed: _restoreFromFile,
+                  icon: const Icon(Icons.upload_file_rounded),
+                  label: const Text('رفع ملف النسخة الاحتياطية من التليفون', style: TextStyle(fontWeight: FontWeight.bold)),
+                ),
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 11)),
+                  onPressed: _restoreFromClipboardDialog,
+                  icon: const Icon(Icons.paste_rounded),
+                  label: const Text('استرجاع عن طريق لصق نص النسخة الاحتياطية', style: TextStyle(fontWeight: FontWeight.bold)),
+                ),
+              ],
+            ),
+          ),
+        ),
       ],
     );
   }
