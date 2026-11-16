@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -9,7 +10,10 @@ void main() {
 }
 
 class CashOfficeApp extends StatelessWidget {
-  const CashOfficeApp({super.key});
+  const CashOfficeApp({super.key, this.testDaily, this.testDebts});
+  final List<CashTransaction>? testDaily;
+  final List<DebtAccount>? testDebts;
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
@@ -27,7 +31,7 @@ class CashOfficeApp extends StatelessWidget {
         ),
       ),
       builder: (ctx, child) => Directionality(textDirection: TextDirection.rtl, child: child ?? const SizedBox.shrink()),
-      home: const CashHomeScreen(),
+      home: CashHomeScreen(testDaily: testDaily, testDebts: testDebts),
     );
   }
 }
@@ -172,8 +176,10 @@ class CashDatabase {
     final existing = await db.query('debts', where: 'settled = 0 AND direction = ? AND person = ?', whereArgs: [direction, person], limit: 1);
     if (existing.isNotEmpty) {
       final id = existing.first['id'] as int;
+      final prevNote = ((existing.first['note'] as String?) ?? '').trim();
       final updated = (((existing.first['amount'] as num?) ?? 0).toDouble()) + amount;
-      await db.update('debts', {'amount': updated, if (note.isNotEmpty) 'note': note, 'updated_at': nowIso}, where: 'id = ?', whereArgs: [id]);
+      final mergedNote = note.isEmpty ? prevNote : (prevNote.isEmpty ? note : '$prevNote • $note');
+      await db.update('debts', {'amount': updated, 'note': mergedNote, 'updated_at': nowIso}, where: 'id = ?', whereArgs: [id]);
       await db.insert('debt_logs', {'debt_id': id, 'kind': 'add', 'delta': amount, 'balance_after': updated, 'note': note.isEmpty ? 'إضافة على القديم' : note, 'created_at': nowIso});
       return 'تمت زيادة ${Fmt.money(amount)} ج على حساب $person (الباقي: ${Fmt.money(updated)} ج)';
     }
@@ -187,27 +193,28 @@ class CashDatabase {
     final id = debt.id!;
     final nowIso = DateTime.now().toIso8601String();
     final cur = debt.settled ? 0.0 : debt.amount;
+    final keepOrSetNote = debt.note.trim().isEmpty && note.isNotEmpty ? note : debt.note;
     if (isIncrease) {
       final nextBal = cur + delta;
-      await db.update('debts', {'amount': nextBal, 'settled': 0, 'updated_at': nowIso}, where: 'id = ?', whereArgs: [id]);
+      await db.update('debts', {'amount': nextBal, 'note': keepOrSetNote, 'settled': 0, 'updated_at': nowIso}, where: 'id = ?', whereArgs: [id]);
       await db.insert('debt_logs', {'debt_id': id, 'kind': 'add', 'delta': delta, 'balance_after': nextBal, 'note': note, 'created_at': nowIso});
       return 'تمت زيادة ${Fmt.money(delta)} ج — الباقي الآن: ${Fmt.money(nextBal)} ج';
     }
     final diff = cur - delta;
     if (diff.abs() < 0.001) {
-      await db.update('debts', {'amount': 0.0, 'last_cleared': cur, 'settled': 1, 'updated_at': nowIso}, where: 'id = ?', whereArgs: [id]);
+      await db.update('debts', {'amount': 0.0, 'last_cleared': cur, 'note': keepOrSetNote, 'settled': 1, 'updated_at': nowIso}, where: 'id = ?', whereArgs: [id]);
       await db.insert('debt_logs', {'debt_id': id, 'kind': 'pay', 'delta': delta, 'balance_after': 0.0, 'note': note.isEmpty ? 'سداد الباقي بالكامل' : note, 'created_at': nowIso});
       return 'تم خصم المبلغ وتصفير حساب ${debt.person}';
     } else if (diff > 0) {
-      await db.update('debts', {'amount': diff, 'settled': 0, 'updated_at': nowIso}, where: 'id = ?', whereArgs: [id]);
+      await db.update('debts', {'amount': diff, 'note': keepOrSetNote, 'settled': 0, 'updated_at': nowIso}, where: 'id = ?', whereArgs: [id]);
       await db.insert('debt_logs', {'debt_id': id, 'kind': 'pay', 'delta': delta, 'balance_after': diff, 'note': note, 'created_at': nowIso});
       return 'تم تنزيل ${Fmt.money(delta)} ج من القديم — الباقي: ${Fmt.money(diff)} ج';
     } else {
       final over = diff.abs();
       final newDir = debt.direction == 'on_me' ? 'for_me' : 'on_me';
       final lbl = newDir == 'on_me' ? 'عليا ليه' : 'ليا عنده';
-      await db.update('debts', {'amount': over, 'direction': newDir, 'settled': 0, 'updated_at': nowIso}, where: 'id = ?', whereArgs: [id]);
-      await db.insert('debt_logs', {'debt_id': id, 'kind': 'pay', 'delta': delta, 'balance_after': over, 'note': 'انقلب الرصيد إلى $lbl', 'created_at': nowIso});
+      await db.update('debts', {'amount': over, 'direction': newDir, 'note': keepOrSetNote, 'settled': 0, 'updated_at': nowIso}, where: 'id = ?', whereArgs: [id]);
+      await db.insert('debt_logs', {'debt_id': id, 'kind': 'pay', 'delta': delta, 'balance_after': over, 'note': '${note.isNotEmpty ? "$note - " : ""}انقلب الرصيد إلى $lbl', 'created_at': nowIso});
       return 'تم الخصم وتحويل الزيادة إلى ($lbl: ${Fmt.money(over)} ج)';
     }
   }
@@ -272,7 +279,9 @@ class Fmt {
 }
 
 class CashHomeScreen extends StatefulWidget {
-  const CashHomeScreen({super.key});
+  const CashHomeScreen({super.key, this.testDaily, this.testDebts});
+  final List<CashTransaction>? testDaily;
+  final List<DebtAccount>? testDebts;
   @override
   State<CashHomeScreen> createState() => _CashHomeScreenState();
 }
@@ -293,7 +302,12 @@ class _CashHomeScreenState extends State<CashHomeScreen> {
   @override
   void initState() {
     super.initState();
-    _load();
+    if (widget.testDaily != null || widget.testDebts != null) {
+      _daily = List<CashTransaction>.from(widget.testDaily ?? const []);
+      _debts = List<DebtAccount>.from(widget.testDebts ?? const []);
+    } else {
+      _load();
+    }
   }
 
   Future<void> _load() async {
@@ -313,6 +327,65 @@ class _CashHomeScreenState extends State<CashHomeScreen> {
     ScaffoldMessenger.of(context)
       ..clearSnackBars()
       ..showSnackBar(SnackBar(content: Text(t), duration: const Duration(seconds: 2), behavior: SnackBarBehavior.floating));
+  }
+
+  String _buildStatement(DebtAccount d) {
+    final b = StringBuffer();
+    b.writeln('📋 *كشف حساب - دفتر الكاش*');
+    b.writeln('العميل: ${d.person}');
+    if (d.note.trim().isNotEmpty) {
+      b.writeln('ملاحظة: ${d.note.trim()}');
+    }
+    b.writeln('━━━━━━━━━━━━━━');
+    if (d.logs.isNotEmpty) {
+      b.writeln('📌 *سجل الحركات:*');
+      for (final ev in d.logs.reversed) {
+        final lbl = ev.kind == 'pay'
+            ? 'تم سداد (-)'
+            : (ev.kind == 'add'
+                ? 'إضافة (+)'
+                : (ev.kind == 'settle' ? 'تصفير الحساب (-)' : (ev.kind == 'reopen' ? 'إرجاع رصيد (+)' : 'بداية الحساب')));
+        final n = ev.note.isNotEmpty ? ' (${ev.note})' : '';
+        b.writeln('• $lbl: ${Fmt.money(ev.delta)} ج ← الباقي: ${Fmt.money(ev.balanceAfter)} ج$n (${Fmt.shortDate(ev.createdAt)})');
+      }
+      b.writeln('━━━━━━━━━━━━━━');
+    }
+    if (d.settled) {
+      b.write('✅ *الحساب خالص بالكامل (الباقي: 0 ج.م)*');
+    } else if (d.isForMe) {
+      b.write('💰 *المبلغ المتبقي للسداد: ${Fmt.money(d.amount)} ج.م*');
+    } else {
+      b.write('💰 *الرصيد المتبقي ليك: ${Fmt.money(d.amount)} ج.م*');
+    }
+    return b.toString();
+  }
+
+  String _extractPhone(String raw) {
+    const east = ['٠', '١', '٢', '٣', '٤', '٥', '٦', '٧', '٨', '٩'];
+    var s = raw;
+    for (var i = 0; i < east.length; i++) {
+      s = s.replaceAll(east[i], i.toString());
+    }
+    final m = RegExp(r'(?:\+?20|0)(1[0125]\d{8})').firstMatch(s.replaceAll(' ', '').replaceAll('-', ''));
+    return m != null ? '20${m.group(1)}' : '';
+  }
+
+  Future<void> _copyStatement(DebtAccount d) async {
+    await Clipboard.setData(ClipboardData(text: _buildStatement(d)));
+    _msg('تم نسخ كشف حساب ${d.person}');
+  }
+
+  Future<void> _shareExternal(DebtAccount d) async {
+    final text = _buildStatement(d);
+    await Clipboard.setData(ClipboardData(text: text));
+    final phone = _extractPhone('${d.person} ${d.note}');
+    final uri = Uri(
+      scheme: 'https',
+      host: 'wa.me',
+      path: phone.isNotEmpty ? '/$phone' : '/',
+      query: 'text=${Uri.encodeComponent(text)}',
+    );
+    await launchUrl(uri, mode: LaunchMode.externalApplication);
   }
 
   Future<void> _addTx() async {
@@ -415,11 +488,39 @@ class _CashHomeScreenState extends State<CashHomeScreen> {
     );
   }
 
+  Widget _heroBox(String label, String value, {Color valColor = Colors.white}) {
+    return Expanded(
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+        decoration: BoxDecoration(
+          color: Colors.white.withAlpha(30),
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(label, style: const TextStyle(color: Colors.white70, fontSize: 11.5, fontWeight: FontWeight.w600)),
+            const SizedBox(height: 2),
+            Text(value, style: TextStyle(color: valColor, fontSize: 15, fontWeight: FontWeight.bold)),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildDaily() {
-    double gain = 0, vol = 0;
+    double gain = 0, vol = 0, depVol = 0, witVol = 0;
+    int depCount = 0, witCount = 0;
     for (final t in _daily) {
       vol += t.amount;
       gain += t.profit;
+      if (t.type == TxType.withdraw) {
+        witVol += t.amount;
+        witCount++;
+      } else {
+        depVol += t.amount;
+        depCount++;
+      }
     }
     return ListView(
       padding: const EdgeInsets.all(12),
@@ -433,7 +534,17 @@ class _CashHomeScreenState extends State<CashHomeScreen> {
               Text(Fmt.dayTitle(_date), style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
               IconButton(onPressed: () { setState(() => _date = _date.add(const Duration(days: 1))); _load(); }, icon: const Icon(Icons.chevron_left, color: Colors.white)),
             ]),
-            Text('ربح اليوم: +${Fmt.money(gain)} ج  •  حركة الكاش (${_daily.length}): ${Fmt.money(vol)} ج', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+            Row(children: [
+              _heroBox('ربح اليوم', '+${Fmt.money(gain)} ج', valColor: const Color(0xFF86EFAC)),
+              const SizedBox(width: 8),
+              _heroBox('حركة الكاش (${_daily.length})', '${Fmt.money(vol)} ج'),
+            ]),
+            const SizedBox(height: 7),
+            Row(children: [
+              _heroBox('مجموع الإيداع ($depCount)', '${Fmt.money(depVol)} ج'),
+              const SizedBox(width: 8),
+              _heroBox('مجموع السحب ($witCount)', '${Fmt.money(witVol)} ج'),
+            ]),
           ]),
         ),
         const SizedBox(height: 10),
@@ -478,8 +589,9 @@ class _CashHomeScreenState extends State<CashHomeScreen> {
         if (d.isForMe) { forMe += d.amount; } else { onMe += d.amount; }
       }
     }
+    final q = _debtSearch.trim().toLowerCase();
     final list = _debts.where((d) {
-      if (_debtSearch.isNotEmpty && !d.person.toLowerCase().contains(_debtSearch.toLowerCase())) return false;
+      if (q.isNotEmpty && !('${d.person} ${d.note}').toLowerCase().contains(q)) return false;
       if (_debtFilter == 'unpaid') return !d.settled;
       if (_debtFilter == 'settled') return d.settled;
       return true;
@@ -510,12 +622,12 @@ class _CashHomeScreenState extends State<CashHomeScreen> {
                 FilledButton(onPressed: _addDebt, child: const Text('إضافة')),
               ]),
               const SizedBox(height: 8),
-              TextField(controller: _debtNoteCtrl, decoration: const InputDecoration(labelText: 'ملاحظة (اختياري)')),
+              TextField(controller: _debtNoteCtrl, onSubmitted: (_) => _addDebt(), decoration: const InputDecoration(labelText: 'رقم التليفون أو ملاحظة (اختياري)')),
             ]),
           ),
         ),
         const SizedBox(height: 8),
-        TextField(onChanged: (v) => setState(() => _debtSearch = v), decoration: const InputDecoration(prefixIcon: Icon(Icons.search), hintText: 'بحث باسم العميل...')),
+        TextField(onChanged: (v) => setState(() => _debtSearch = v), decoration: const InputDecoration(prefixIcon: Icon(Icons.search), hintText: 'بحث باسم العميل أو الملاحظة...')),
         const SizedBox(height: 8),
         Row(children: [
           for (final f in [('unpaid', 'غير خالص'), ('settled', 'خالص'), ('all', 'الكل')])
@@ -525,25 +637,81 @@ class _CashHomeScreenState extends State<CashHomeScreen> {
         ...list.map((d) {
           final id = d.id ?? 0;
           final exp = _expanded.contains(id);
+          final cleanNote = d.note.trim();
           return Card(
             child: Padding(
               padding: const EdgeInsets.all(12),
               child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-                Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-                  Expanded(child: Text('${d.person} (${d.isForMe ? "ليا عنده" : "عليا ليه"})', style: const TextStyle(fontWeight: FontWeight.bold))),
+                Row(children: [
+                  Expanded(
+                    child: Wrap(
+                      spacing: 6,
+                      runSpacing: 4,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        Text('${d.person} (${d.isForMe ? "ليا عنده" : "عليا ليه"})', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                        InkWell(
+                          borderRadius: BorderRadius.circular(999),
+                          onTap: () => _shareExternal(d),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+                            decoration: BoxDecoration(color: const Color(0xFFDCFCE7), borderRadius: BorderRadius.circular(999), border: Border.all(color: const Color(0xFF86EFAC))),
+                            child: const Row(mainAxisSize: MainAxisSize.min, children: [
+                              Icon(Icons.send_rounded, size: 13, color: Color(0xFF15803D)),
+                              SizedBox(width: 4),
+                              Text('مشاركة الكشف', style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold, color: Color(0xFF15803D))),
+                            ]),
+                          ),
+                        ),
+                        InkWell(
+                          borderRadius: BorderRadius.circular(999),
+                          onTap: () => _copyStatement(d),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                            decoration: BoxDecoration(color: const Color(0xFFF1F5F9), borderRadius: BorderRadius.circular(999)),
+                            child: const Row(mainAxisSize: MainAxisSize.min, children: [
+                              Icon(Icons.copy_rounded, size: 13, color: Color(0xFF334155)),
+                              SizedBox(width: 3),
+                              Text('نسخ', style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold, color: Color(0xFF334155))),
+                            ]),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
                   Text(d.settled ? '0 ج (خالص)' : 'الباقي: ${Fmt.money(d.amount)} ج', style: TextStyle(fontWeight: FontWeight.bold, color: d.isForMe ? const Color(0xFF15803D) : const Color(0xFFB91C1C))),
                   IconButton(icon: const Icon(Icons.delete_outline, size: 20), onPressed: () async { await CashDatabase.instance.deleteDebt(id); _load(); }),
                 ]),
+                if (cleanNote.isNotEmpty)
+                  Container(
+                    margin: const EdgeInsets.only(top: 6),
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFF8FAFC),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: const Color(0xFFE2E8F0)),
+                    ),
+                    child: Row(children: [
+                      const Icon(Icons.notes_rounded, size: 15, color: Color(0xFF0F766E)),
+                      const SizedBox(width: 6),
+                      Expanded(child: Text('ملاحظة: $cleanNote', style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: Color(0xFF334155)))),
+                    ]),
+                  ),
+                const SizedBox(height: 6),
                 Wrap(spacing: 6, children: [
                   if (!d.settled) OutlinedButton(onPressed: () => _openAdjustSheet(d, false), child: const Text('- سداد جزء')),
                   OutlinedButton(onPressed: () => _openAdjustSheet(d, true), child: const Text('+ زوّد مبلغ')),
                   TextButton(onPressed: () async { final r = await CashDatabase.instance.toggleSettleFull(d); await _load(); _msg(r); }, child: Text(d.settled ? 'إرجاع' : 'تسديد الكل ✓')),
                   TextButton(onPressed: () => setState(() => exp ? _expanded.remove(id) : _expanded.add(id)), child: Text('الحركات (${d.logs.length})')),
                 ]),
-                if (exp) ...d.logs.map((ev) => Padding(
-                  padding: const EdgeInsets.only(top: 4),
-                  child: Text('${ev.kind == "pay" ? "سدد جزء (-)" : (ev.kind == "add" ? "زيادة (+)" : "حركة")}: ${Fmt.money(ev.delta)} ج  ←  الباقي: ${Fmt.money(ev.balanceAfter)} ج (${Fmt.shortDate(ev.createdAt)})', style: const TextStyle(fontSize: 12)),
-                )),
+                if (exp) ...d.logs.map((ev) {
+                  final evNote = ev.note.trim().isNotEmpty ? ' • (${ev.note.trim()})' : '';
+                  final kindTxt = ev.kind == 'pay' ? 'سدد جزء (-)' : (ev.kind == 'add' ? 'زيادة (+)' : (ev.kind == 'settle' ? 'تصفير (-)' : (ev.kind == 'reopen' ? 'إرجاع (+)' : 'بداية الحساب')));
+                  return Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Text('$kindTxt: ${Fmt.money(ev.delta)} ج  ←  الباقي: ${Fmt.money(ev.balanceAfter)} ج$evNote (${Fmt.shortDate(ev.createdAt)})', style: const TextStyle(fontSize: 12)),
+                  );
+                }),
               ]),
             ),
           );
