@@ -136,10 +136,18 @@ class DebtAccount {
   }
 }
 
+class _ScreenNode {
+  const _ScreenNode({required this.t, required this.x, required this.y, required this.top, required this.bot});
+  final String t;
+  final int x, y, top, bot;
+}
+
 class BackupPayload {
   const BackupPayload({required this.transactions, required this.debts});
   final List<CashTransaction> transactions;
   final List<DebtAccount> debts;
+
+  static const _arMonths = ['يناير', 'فبراير', 'مارس', 'أبريل', 'مايو', 'يونيو', 'يوليو', 'أغسطس', 'سبتمبر', 'أكتوبر', 'نوفمبر', 'ديسمبر'];
 
   static String encode({required List<CashTransaction> transactions, required List<DebtAccount> debts}) {
     final map = {
@@ -167,12 +175,305 @@ class BackupPayload {
     return double.tryParse(clean);
   }
 
+  static DateTime? _tryParseArabicDayHeader(String raw, DateTime refNow) {
+    final s = _normDigits(raw).trim();
+    if (s.length > 48 || s.contains('الباقي') || s.contains('•') || s.contains('←')) return null;
+    if (s.startsWith('اليوم -')) {
+      return DateTime(refNow.year, refNow.month, refNow.day);
+    }
+    final m = RegExp(r'(?:الإثنين|الثلاثاء|الأربعاء|الخميس|الجمعة|السبت|الأحد)\s+(\d{1,2})\s+(\S+)(?:\s+(\d{4}))?').firstMatch(s);
+    if (m == null) return null;
+    final day = int.tryParse(m.group(1)!) ?? refNow.day;
+    final mName = m.group(2)!.trim();
+    final mIdx = _arMonths.indexOf(mName);
+    if (mIdx < 0) return null;
+    final yr = m.group(3) != null ? (int.tryParse(m.group(3)!) ?? refNow.year) : refNow.year;
+    return DateTime(yr, mIdx + 1, day);
+  }
+
+  static DateTime _parseShortDateOrFallback(String tail, DateTime fallback) {
+    final s = _normDigits(tail);
+    final m = RegExp(r'(?:الإثنين|الثلاثاء|الأربعاء|الخميس|الجمعة|السبت|الأحد)\s+(\d{1,2})\s+([^\s)]+)').firstMatch(s);
+    if (m != null) {
+      final d = int.tryParse(m.group(1)!) ?? fallback.day;
+      final mIdx = _arMonths.indexOf(m.group(2)!.trim());
+      if (mIdx >= 0) {
+        return DateTime(fallback.year, mIdx + 1, d, 12, 0);
+      }
+    }
+    return fallback;
+  }
+
+  static BackupPayload decodeExtractedFrames(String rawFramesJson, {DateTime? nowOverride}) {
+    final refNow = nowOverride ?? DateTime.now();
+    final decoded = jsonDecode(rawFramesJson);
+    if (decoded is! List || decoded.isEmpty) {
+      return const BackupPayload(transactions: [], debts: []);
+    }
+
+    var activeDate = DateTime(refNow.year, refNow.month, refNow.day);
+    final txSampleBySig = <String, CashTransaction>{};
+    final txMaxCountBySig = <String, int>{};
+    final debtByKey = <String, DebtAccount>{};
+
+    for (final frameObj in decoded.whereType<Map>()) {
+      final rawNodes = (frameObj['nodes'] as List<dynamic>?) ?? const [];
+      final nodes = <_ScreenNode>[];
+      final seenNodePos = <String>{};
+
+      for (final rn in rawNodes.whereType<Map>()) {
+        final t = _normDigits(((rn['t'] as String?) ?? '').trim());
+        if (t.isEmpty) continue;
+        final x = ((rn['x'] as num?) ?? 0).toInt();
+        final y = ((rn['y'] as num?) ?? 0).toInt();
+        final top = ((rn['top'] as num?) ?? y).toInt();
+        final bot = ((rn['bot'] as num?) ?? y).toInt();
+        final dedupKey = '$t|${x ~/ 16}|${y ~/ 16}';
+        if (seenNodePos.add(dedupKey)) {
+          nodes.add(_ScreenNode(t: t, x: x, y: y, top: top, bot: bot));
+        }
+      }
+      if (nodes.isEmpty) continue;
+
+      nodes.sort((a, b) {
+        if ((a.y - b.y).abs() < 26) return b.x.compareTo(a.x);
+        return a.y.compareTo(b.y);
+      });
+
+      for (final n in nodes) {
+        for (final ln in n.t.split('\n')) {
+          final parsedHdr = _tryParseArabicDayHeader(ln, refNow);
+          if (parsedHdr != null) {
+            activeDate = parsedHdr;
+            break;
+          }
+        }
+      }
+
+      var bottomCutoff = 999999;
+      for (final n in nodes) {
+        if ((n.t.contains('معاملات اليوم') || n.t.contains('جرد الشهر')) && n.y > 400) {
+          if (n.top - 8 < bottomCutoff) bottomCutoff = n.top - 8;
+        }
+      }
+
+      final usedAux = <int>{};
+      final frameSigCounts = <String, int>{};
+      final txRegex = RegExp(r'^(إيداع|ايداع|سحب|تحويل)\s*[•·]\s*([\d,.]+)\s*ج');
+
+      for (var i = 0; i < nodes.length; i++) {
+        final n = nodes[i];
+        if (n.y >= bottomCutoff) continue;
+        final nLines = n.t.split('\n').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+        RegExpMatch? txM;
+        for (final ln in nLines) {
+          txM = txRegex.firstMatch(ln);
+          if (txM != null) break;
+        }
+        if (txM == null) continue;
+
+        final isWit = txM.group(1) == 'سحب';
+        final amt = _numFromStr(txM.group(2)) ?? 0;
+        if (amt <= 0) continue;
+
+        double? profit;
+        String? timeKey;
+        var hr = 12, mn = 0;
+
+        for (final ln in nLines) {
+          final pm = RegExp(r'^\+\s*([\d,.]+)\s*ج$').firstMatch(ln);
+          if (pm != null) profit = _numFromStr(pm.group(1));
+          final tm = RegExp(r'^(\d{1,2}):(\d{2})\s*(ص|م)$').firstMatch(ln);
+          if (tm != null) {
+            hr = int.tryParse(tm.group(1)!) ?? 12;
+            mn = int.tryParse(tm.group(2)!) ?? 0;
+            final isPm = tm.group(3) == 'م';
+            if (isPm && hr < 12) hr += 12;
+            if (!isPm && hr == 12) hr = 0;
+            timeKey = '${hr.toString().padLeft(2, '0')}:${mn.toString().padLeft(2, '0')}';
+          }
+        }
+
+        if (profit == null || timeKey == null) {
+          final nearIndices = <int>[];
+          for (var j = 0; j < nodes.length; j++) {
+            if (j == i || usedAux.contains(j)) continue;
+            if ((nodes[j].y - n.y).abs() <= 90 && nodes[j].y < bottomCutoff) {
+              nearIndices.add(j);
+            }
+          }
+          nearIndices.sort((a, b) => (nodes[a].y - n.y).abs().compareTo((nodes[b].y - n.y).abs()));
+          for (final j in nearIndices) {
+            for (final ln in nodes[j].t.split('\n').map((e) => e.trim())) {
+              if (profit == null) {
+                final pm = RegExp(r'^\+\s*([\d,.]+)\s*ج$').firstMatch(ln);
+                if (pm != null) {
+                  profit = _numFromStr(pm.group(1));
+                  usedAux.add(j);
+                }
+              }
+              if (timeKey == null) {
+                final tm = RegExp(r'^(\d{1,2}):(\d{2})\s*(ص|م)$').firstMatch(ln);
+                if (tm != null) {
+                  hr = int.tryParse(tm.group(1)!) ?? 12;
+                  mn = int.tryParse(tm.group(2)!) ?? 0;
+                  final isPm = tm.group(3) == 'م';
+                  if (isPm && hr < 12) hr += 12;
+                  if (!isPm && hr == 12) hr = 0;
+                  timeKey = '${hr.toString().padLeft(2, '0')}:${mn.toString().padLeft(2, '0')}';
+                  usedAux.add(j);
+                }
+              }
+            }
+          }
+        }
+
+        final finalProfit = profit ?? 0.0;
+        final finalTimeKey = timeKey ?? '12:00';
+        final dt = DateTime(activeDate.year, activeDate.month, activeDate.day, hr, mn);
+        final tx = CashTransaction(
+          type: isWit ? TxType.withdraw : TxType.deposit,
+          amount: amt,
+          profit: finalProfit,
+          createdAt: dt,
+        );
+        final sig = '${Fmt.toDateKey(activeDate)}|${tx.type.code}|$amt|$finalProfit|$finalTimeKey';
+        txSampleBySig[sig] = tx;
+        frameSigCounts[sig] = (frameSigCounts[sig] ?? 0) + 1;
+      }
+
+      frameSigCounts.forEach((sig, cnt) {
+        final prev = txMaxCountBySig[sig] ?? 0;
+        if (cnt > prev) txMaxCountBySig[sig] = cnt;
+      });
+
+      final custAnchors = <({int idx, String person, String dir, int top, int y})>[];
+      final custRe = RegExp(r'^(.+?)\s*\(\s*(ليا عنده|عليا ليه)\s*\)$');
+
+      for (var i = 0; i < nodes.length; i++) {
+        final n = nodes[i];
+        if (n.y >= bottomCutoff) continue;
+        for (final ln in n.t.split('\n').map((e) => e.trim())) {
+          final cm = custRe.firstMatch(ln);
+          if (cm != null) {
+            final person = cm.group(1)!.replaceAll(RegExp(r'(مشاركة الكشف|نسخ)'), '').trim();
+            final dir = cm.group(2)!.contains('عليا') ? 'on_me' : 'for_me';
+            if (person.isNotEmpty) {
+              custAnchors.add((idx: i, person: person, dir: dir, top: n.top, y: n.y));
+              break;
+            }
+          }
+        }
+      }
+
+      if (custAnchors.isNotEmpty) {
+        custAnchors.sort((a, b) => a.y.compareTo(b.y));
+        for (var k = 0; k < custAnchors.length; k++) {
+          final anc = custAnchors[k];
+          final yMin = anc.top - 28;
+          final yMax = (k + 1 < custAnchors.length) ? (custAnchors[k + 1].top - 10) : bottomCutoff;
+
+          double? amount;
+          var settled = false;
+          var note = '';
+          final cardLogs = <DebtLogEntry>[];
+
+          for (final n in nodes) {
+            if (n.y < yMin || n.y > yMax) continue;
+            for (final rawLn in n.t.split('\n')) {
+              final ln = rawLn.trim();
+              if (ln.isEmpty) continue;
+
+              if (!ln.contains('←')) {
+                if (ln.contains('0 ج') && ln.contains('خالص')) {
+                  settled = true;
+                  amount = 0.0;
+                } else {
+                  final remM = RegExp(r'^الباقي\s*:\s*([\d,.]+)\s*ج').firstMatch(ln);
+                  if (remM != null) {
+                    amount = _numFromStr(remM.group(1));
+                    settled = false;
+                  }
+                }
+              }
+
+              if (ln.startsWith('ملاحظة:')) {
+                note = ln.replaceFirst('ملاحظة:', '').trim();
+              }
+
+              final logM = RegExp(r'^(سدد جزء|تم سداد|زيادة|إضافة|تصفير|إرجاع|بداية الحساب)[^:]*:\s*([\d,.]+)\s*ج\s*←\s*الباقي\s*:\s*([\d,.]+)\s*ج(.*)$').firstMatch(ln);
+              if (logM != null) {
+                final kTxt = logM.group(1)!;
+                final delta = _numFromStr(logM.group(2)) ?? 0;
+                final balAfter = _numFromStr(logM.group(3)) ?? 0;
+                final tail = logM.group(4) ?? '';
+                final kind = (kTxt.contains('سدد') || kTxt.contains('سداد'))
+                    ? 'pay'
+                    : ((kTxt.contains('زيادة') || kTxt.contains('إضافة'))
+                        ? 'add'
+                        : (kTxt.contains('تصفير') ? 'settle' : (kTxt.contains('إرجاع') ? 'reopen' : 'init')));
+                var evNote = '';
+                final noteMatch = RegExp(r'•\s*\(([^)]+)\)').firstMatch(tail);
+                if (noteMatch != null) {
+                  evNote = noteMatch.group(1)!.trim();
+                }
+                if (note.isEmpty && kind == 'init' && evNote.isNotEmpty && evNote != 'بداية الحساب') {
+                  note = evNote;
+                }
+                cardLogs.add(DebtLogEntry(
+                  debtId: 0,
+                  kind: kind,
+                  delta: delta,
+                  balanceAfter: balAfter,
+                  note: evNote,
+                  createdAt: _parseShortDateOrFallback(tail, refNow),
+                ));
+              }
+            }
+          }
+
+          if (amount != null || settled) {
+            final key = '${anc.person}|${anc.dir}';
+            final prev = debtByKey[key];
+            final mergedNote = note.isNotEmpty ? note : (prev?.note ?? '');
+            final bestLogs = cardLogs.length >= (prev?.logs.length ?? 0) ? cardLogs : (prev?.logs ?? const []);
+            final finalAmt = amount ?? 0.0;
+            debtByKey[key] = DebtAccount(
+              person: anc.person,
+              amount: finalAmt,
+              lastClearedAmount: finalAmt,
+              direction: anc.dir,
+              note: mergedNote,
+              settled: settled,
+              logs: bestLogs,
+            );
+          }
+        }
+      }
+    }
+
+    final finalTxs = <CashTransaction>[];
+    txMaxCountBySig.forEach((sig, cnt) {
+      final sample = txSampleBySig[sig];
+      if (sample != null) {
+        for (var c = 0; c < cnt; c++) {
+          finalTxs.add(sample);
+        }
+      }
+    });
+
+    return BackupPayload(transactions: finalTxs, debts: debtByKey.values.toList());
+  }
+
   static BackupPayload decode(String rawInput, {DateTime? fallbackDate}) {
     final cleaned = rawInput.replaceFirst('\uFEFF', '').trim();
     if (cleaned.isEmpty) throw const FormatException('النص أو الملف فارغ');
     if (cleaned.startsWith('{') || cleaned.startsWith('[')) {
       final decoded = jsonDecode(cleaned);
       if (decoded is List) {
+        if (decoded.isNotEmpty && decoded.first is Map && (decoded.first as Map).containsKey('nodes')) {
+          return decodeExtractedFrames(cleaned, nowOverride: fallbackDate);
+        }
         final txs = decoded.whereType<Map>().map((e) => CashTransaction.fromMap(Map<String, Object?>.from(e))).toList();
         return BackupPayload(transactions: txs, debts: const []);
       }
@@ -201,281 +502,26 @@ class BackupPayload {
 
   static BackupPayload parseSmartText(String rawText, {DateTime? baseDate}) {
     final norm = _normDigits(rawText);
-    final base = baseDate ?? DateTime.now();
-    final txs = <CashTransaction>[];
     final debts = <DebtAccount>[];
-
-    // 1. Parse copied WhatsApp statement blocks (supports 1 or dozens pasted back-to-back)
     if (norm.contains('العميل:')) {
       final chunks = norm.split(RegExp(r'(?=📋\s*\*?كشف حساب)|(?=العميل\s*:)'));
-      final mergedChunks = <String>[];
-      for (final ch in chunks) {
-        if (ch.trim().isEmpty) continue;
-        if (mergedChunks.isNotEmpty &&
-            mergedChunks.last.contains('كشف حساب') &&
-            !mergedChunks.last.contains('العميل:') &&
-            ch.trimLeft().startsWith('العميل')) {
-          mergedChunks[mergedChunks.length - 1] = '${mergedChunks.last}\n$ch';
-        } else {
-          mergedChunks.add(ch);
-        }
-      }
-      for (final block in mergedChunks) {
+      for (final block in chunks) {
         final pm = RegExp(r'العميل\s*:\s*(.+)').firstMatch(block);
         if (pm == null) continue;
         final person = pm.group(1)!.replaceAll('*', '').trim();
         if (person.isEmpty) continue;
         final nm = RegExp(r'ملاحظة\s*:\s*(.+)').firstMatch(block);
         final note = nm != null ? nm.group(1)!.trim() : '';
-
-        var direction = 'for_me';
-        var settled = false;
-        double amount = 0;
-
-        final remForMe = RegExp(r'المبلغ المتبقي للسداد\s*:\s*([\d,.]+)').firstMatch(block);
         final remOnMe = RegExp(r'الرصيد المتبقي ليك\s*:\s*([\d,.]+)').firstMatch(block);
-        if (block.contains('الحساب خالص بالكامل')) {
-          settled = true;
-          amount = 0;
-        } else if (remOnMe != null) {
-          direction = 'on_me';
-          amount = _numFromStr(remOnMe.group(1)) ?? 0;
-        } else if (remForMe != null) {
-          direction = 'for_me';
-          amount = _numFromStr(remForMe.group(1)) ?? 0;
-        }
-
-        final chronoLogs = <DebtLogEntry>[];
-        for (final line in block.split('\n')) {
-          final lm = RegExp(r'[•\-*]\s*([^:]+):\s*([\d,.]+)\s*ج.*?الباقي\s*:\s*([\d,.]+)\s*ج(.*)$').firstMatch(line.trim());
-          if (lm != null) {
-            final kRaw = lm.group(1)!;
-            final delta = _numFromStr(lm.group(2)) ?? 0;
-            final balAfter = _numFromStr(lm.group(3)) ?? 0;
-            final tail = lm.group(4) ?? '';
-            final kind = kRaw.contains('سداد') || kRaw.contains('سدد')
-                ? 'pay'
-                : (kRaw.contains('إضافة') || kRaw.contains('زيادة')
-                    ? 'add'
-                    : (kRaw.contains('تصفير') ? 'settle' : (kRaw.contains('إرجاع') ? 'reopen' : 'init')));
-            var logNote = '';
-            final parenMatches = RegExp(r'\(([^)]+)\)').allMatches(tail).toList();
-            if (parenMatches.length >= 2) {
-              logNote = parenMatches.first.group(1)!.trim();
-            }
-            chronoLogs.add(DebtLogEntry(
-              debtId: 0,
-              kind: kind,
-              delta: delta,
-              balanceAfter: balAfter,
-              note: logNote,
-              createdAt: base,
-            ));
-          }
-        }
-        if (amount == 0 && !settled && chronoLogs.isNotEmpty) {
-          amount = chronoLogs.last.balanceAfter;
-        }
-        debts.add(DebtAccount(
-          person: person,
-          amount: amount,
-          lastClearedAmount: amount,
-          direction: direction,
-          note: note,
-          settled: settled,
-          logs: chronoLogs.reversed.toList(),
-        ));
-      }
-      if (debts.isNotEmpty) {
-        return BackupPayload(transactions: txs, debts: debts);
+        final remForMe = RegExp(r'المبلغ المتبقي للسداد\s*:\s*([\d,.]+)').firstMatch(block);
+        final settled = block.contains('الحساب خالص بالكامل');
+        final dir = remOnMe != null ? 'on_me' : 'for_me';
+        final amt = settled ? 0.0 : (_numFromStr((remOnMe ?? remForMe)?.group(1)) ?? 0.0);
+        debts.add(DebtAccount(person: person, amount: amt, lastClearedAmount: amt, direction: dir, note: note, settled: settled, logs: const []));
       }
     }
-
-    // 2. Parse OCR text from Old App screenshots (Google Lens / Gallery) & Quick Manual Lines
-    final lines = norm.split('\n').map((l) => l.trim()).where((l) => l.isNotEmpty).toList();
-    final consumed = <int>{};
-
-    const ignoreKeywords = [
-      'دفتر الكاش',
-      'سجل الآجل',
-      'جرد الأرباح',
-      'ربح اليوم',
-      'حركة الكاش',
-      'مجموع الإيداع',
-      'مجموع السحب',
-      'فلوس ليا بره',
-      'فلوس عليا',
-      'معاملات اليوم',
-      'الآجل والديون',
-      'جرد الشهر',
-      'نسخة احتياطية',
-      'غير خالص',
-      'تسديد الكل',
-      'سداد جزء',
-      'زوّد مبلغ',
-      'مشاركة الكشف',
-      'إجمالي مكسب',
-    ];
-
-    for (var i = 0; i < lines.length; i++) {
-      if (consumed.contains(i)) continue;
-      final line = lines[i];
-
-      // Match Old App Debt Card OCR (supports RTL or LTR column order from Lens)
-      final dirMatch = RegExp(r'\(\s*(ليا عنده|عليا ليه)\s*\)').firstMatch(line);
-      if (dirMatch != null) {
-        final dir = dirMatch.group(1)!.contains('عليا') ? 'on_me' : 'for_me';
-        var rawBefore = line.substring(0, dirMatch.start);
-        var rawAfter = line.substring(dirMatch.end);
-        double? amt;
-        var settled = false;
-        var note = '';
-
-        final sameLineRem = RegExp(r'الباقي\s*:\s*([\d,.]+)').firstMatch(line);
-        if (sameLineRem != null) amt = _numFromStr(sameLineRem.group(1));
-        if (line.contains('خالص') && !line.contains('غير خالص')) {
-          settled = true;
-          amt = 0;
-        }
-
-        final personClean = rawBefore
-            .replaceAll(RegExp(r'الباقي\s*:\s*[\d,.]+\s*ج?'), '')
-            .replaceAll(RegExp(r'(مشاركة الكشف|نسخ|0\s*ج\s*\(خالص\))'), '')
-            .trim();
-        final personFallback = rawAfter
-            .replaceAll(RegExp(r'الباقي\s*:\s*[\d,.]+\s*ج?'), '')
-            .replaceAll(RegExp(r'(مشاركة الكشف|نسخ|0\s*ج\s*\(خالص\))'), '')
-            .trim();
-        final person = personClean.isNotEmpty ? personClean : personFallback;
-
-        if (amt == null && !settled && i > 0 && !consumed.contains(i - 1)) {
-          final prevRem = RegExp(r'^الباقي\s*:\s*([\d,.]+)').firstMatch(lines[i - 1]);
-          if (prevRem != null) {
-            amt = _numFromStr(prevRem.group(1));
-            consumed.add(i - 1);
-          }
-        }
-
-        for (var j = i + 1; j < lines.length && j <= i + 5; j++) {
-          final nxt = lines[j];
-          if (RegExp(r'\(\s*(ليا عنده|عليا ليه)\s*\)').hasMatch(nxt)) break;
-          final remM = RegExp(r'الباقي\s*:\s*([\d,.]+)').firstMatch(nxt);
-          if (remM != null && amt == null) {
-            amt = _numFromStr(remM.group(1));
-            consumed.add(j);
-          } else if (nxt.contains('0 ج') && nxt.contains('خالص')) {
-            settled = true;
-            amt = 0;
-            consumed.add(j);
-          } else if (nxt.startsWith('ملاحظة:')) {
-            note = nxt.replaceFirst('ملاحظة:', '').trim();
-            consumed.add(j);
-          }
-        }
-
-        if (person.isNotEmpty && (amt != null || settled)) {
-          consumed.add(i);
-          final finalAmt = amt ?? 0;
-          debts.add(DebtAccount(
-            person: person,
-            amount: finalAmt,
-            lastClearedAmount: finalAmt,
-            direction: dir,
-            note: note,
-            settled: settled,
-            logs: const [],
-          ));
-          continue;
-        }
-      }
-
-      // Match Old App Daily Transaction Card OCR or quick tx line
-      final txMatch = RegExp(r'(إيداع|ايداع|سحب)\s*[•·.*:\-]?\s*([\d,.]+)\s*(?:ج\.?م?|ج)?').firstMatch(line);
-      if (txMatch != null && !line.contains('مجموع') && !line.contains('حركة الكاش')) {
-        final isWit = txMatch.group(1) == 'سحب';
-        final amt = _numFromStr(txMatch.group(2)) ?? 0;
-        double profit = 0;
-        var txTime = base;
-
-        final inlinePlus = RegExp(r'\+\s*([\d,.]+)').firstMatch(line);
-        if (inlinePlus != null) {
-          profit = _numFromStr(inlinePlus.group(1)) ?? 0;
-        } else {
-          final afterAmt = line.substring(txMatch.end).trim();
-          final secondNum = RegExp(r'^([\d,.]+)\s*(?:ج\.?م?|ج)?$').firstMatch(afterAmt);
-          if (secondNum != null) profit = _numFromStr(secondNum.group(1)) ?? 0;
-        }
-
-        if (profit == 0 && i > 0 && !consumed.contains(i - 1)) {
-          final prevProf = RegExp(r'^\+\s*([\d,.]+)\s*(?:ج\.?م?|ج)?$').firstMatch(lines[i - 1]);
-          if (prevProf != null) {
-            profit = _numFromStr(prevProf.group(1)) ?? 0;
-            consumed.add(i - 1);
-          }
-        }
-
-        for (var j = i + 1; j < lines.length && j <= i + 3; j++) {
-          if (consumed.contains(j)) continue;
-          final nxt = lines[j];
-          if (RegExp(r'(إيداع|ايداع|سحب)\s*[•·.*:\-]?\s*[\d,.]+').hasMatch(nxt)) break;
-          final profM = RegExp(r'^\+\s*([\d,.]+)\s*(?:ج\.?م?|ج)?$').firstMatch(nxt);
-          if (profM != null) {
-            profit = _numFromStr(profM.group(1)) ?? profit;
-            consumed.add(j);
-            continue;
-          }
-          final tmM = RegExp(r'^(\d{1,2}):(\d{2})\s*(ص|م)$').firstMatch(nxt);
-          if (tmM != null) {
-            var hr = int.tryParse(tmM.group(1)!) ?? 12;
-            final mn = int.tryParse(tmM.group(2)!) ?? 0;
-            final pm = tmM.group(3) == 'م';
-            if (pm && hr < 12) hr += 12;
-            if (!pm && hr == 12) hr = 0;
-            txTime = DateTime(base.year, base.month, base.day, hr, mn);
-            consumed.add(j);
-          }
-        }
-        if (amt > 0) {
-          consumed.add(i);
-          txs.add(CashTransaction(
-            type: isWit ? TxType.withdraw : TxType.deposit,
-            amount: amt,
-            profit: profit,
-            createdAt: txTime,
-          ));
-          continue;
-        }
-      }
-
-      // Match Quick Manual Debt Line: "[عليا] اسم العميل 600 [ملاحظة]"
-      final isIgnored = ignoreKeywords.any((kw) => line.contains(kw));
-      if (!isIgnored && !line.startsWith('الباقي') && !line.startsWith('+')) {
-        final quickDebt = RegExp(r'^(?:(عليا|ليا)\s+)?([^\d:+•\-()]{2,35}?)\s*[:\-]?\s*([\d,]+(?:\.\d+)?)\s*(?:ج\.?م?|ج)?(?:\s+(.+))?$').firstMatch(line);
-        if (quickDebt != null) {
-          final prefixDir = quickDebt.group(1);
-          final person = quickDebt.group(2)!.trim();
-          final amt = _numFromStr(quickDebt.group(3)) ?? 0;
-          final note = (quickDebt.group(4) ?? '').trim();
-          if (person.isNotEmpty && amt > 0) {
-            consumed.add(i);
-            debts.add(DebtAccount(
-              person: person,
-              amount: amt,
-              lastClearedAmount: amt,
-              direction: prefixDir == 'عليا' ? 'on_me' : 'for_me',
-              note: note,
-              settled: false,
-              logs: const [],
-            ));
-          }
-        }
-      }
-    }
-
-    if (txs.isEmpty && debts.isEmpty) {
-      throw const FormatException('لم يتم التعرف على معاملات أو أرصدة في النص المنسوخ');
-    }
-    return BackupPayload(transactions: txs, debts: debts);
+    if (debts.isEmpty) throw const FormatException('النص المنسوخ غير صالح');
+    return BackupPayload(transactions: const [], debts: debts);
   }
 }
 
@@ -617,11 +663,7 @@ class CashDatabase {
     }
   }
 
-  Future<String> restoreBackupJson(String rawInput, {required bool replaceAll, DateTime? fallbackDate}) async {
-    final payload = rawInput.startsWith('__SQLITE_FILE__:')
-        ? await _readExternalSqlitePayload(rawInput.substring('__SQLITE_FILE__:'.length))
-        : BackupPayload.decode(rawInput, fallbackDate: fallbackDate);
-
+  Future<({int addedTx, int addedDebts})> applyPayload(BackupPayload payload, {required bool replaceAll}) async {
     final db = await database;
     var addedTx = 0;
     var addedDebts = 0;
@@ -652,8 +694,8 @@ class CashDatabase {
         if (!replaceAll) {
           final dupD = await txn.query(
             'debts',
-            where: 'person = ? AND direction = ? AND amount = ? AND settled = ?',
-            whereArgs: [d.person, d.direction, d.amount, d.settled ? 1 : 0],
+            where: 'person = ? AND direction = ?',
+            whereArgs: [d.person, d.direction],
             limit: 1,
           );
           if (dupD.isNotEmpty) continue;
@@ -693,7 +735,15 @@ class CashDatabase {
       }
     });
 
-    return 'تم استيراد $addedTx معاملة و$addedDebts حساب آجل بنجاح';
+    return (addedTx: addedTx, addedDebts: addedDebts);
+  }
+
+  Future<String> restoreBackupJson(String rawInput, {required bool replaceAll, DateTime? fallbackDate}) async {
+    final payload = rawInput.startsWith('__SQLITE_FILE__:')
+        ? await _readExternalSqlitePayload(rawInput.substring('__SQLITE_FILE__:'.length))
+        : BackupPayload.decode(rawInput, fallbackDate: fallbackDate);
+    final res = await applyPayload(payload, replaceAll: replaceAll);
+    return 'تم استيراد ${res.addedTx} معاملة و${res.addedDebts} حساب آجل بنجاح';
   }
 
   Future<String> addOrMergeDebt(String person, double amount, String direction, String note) async {
@@ -812,7 +862,7 @@ class CashHomeScreen extends StatefulWidget {
   State<CashHomeScreen> createState() => _CashHomeScreenState();
 }
 
-class _CashHomeScreenState extends State<CashHomeScreen> {
+class _CashHomeScreenState extends State<CashHomeScreen> with WidgetsBindingObserver {
   static const _backupChannel = MethodChannel('daftar_el_cash/backup');
 
   int _tab = 0;
@@ -823,6 +873,8 @@ class _CashHomeScreenState extends State<CashHomeScreen> {
   final _personCtrl = TextEditingController(), _debtAmtCtrl = TextEditingController(), _debtNoteCtrl = TextEditingController();
   String _debtDir = 'for_me', _debtFilter = 'unpaid', _debtSearch = '';
   bool _replaceOnRestore = false;
+  bool _waitingForAccessibilityGrant = false;
+  int _totalTxCount = 0;
   final Set<int> _expanded = {};
   List<CashTransaction> _daily = [];
   List<DebtAccount> _debts = [];
@@ -831,21 +883,152 @@ class _CashHomeScreenState extends State<CashHomeScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     if (widget.testDaily != null || widget.testDebts != null) {
       _daily = List<CashTransaction>.from(widget.testDaily ?? const []);
       _debts = List<DebtAccount>.from(widget.testDebts ?? const []);
+      _totalTxCount = _daily.length;
     } else {
-      _load();
+      _load().then((_) => _consumePendingExtractedData());
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && widget.testDaily == null && widget.testDebts == null) {
+      _onAppResumed();
+    }
+  }
+
+  Future<void> _onAppResumed() async {
+    await _consumePendingExtractedData();
+    if (_waitingForAccessibilityGrant) {
+      try {
+        final enabled = await _backupChannel.invokeMethod<bool>('isExtractorEnabled') ?? false;
+        if (enabled) {
+          _waitingForAccessibilityGrant = false;
+          if (mounted && Navigator.of(context).canPop()) {
+            Navigator.of(context).pop();
+          }
+          await _triggerOldAppAutoExtraction();
+        }
+      } catch (_) {}
+    }
+  }
+
+  Future<void> _consumePendingExtractedData() async {
+    try {
+      final rawFrames = await _backupChannel.invokeMethod<String>('readExtractedFrames');
+      if (rawFrames == null || rawFrames.trim().isEmpty || rawFrames.trim() == '[]') return;
+      final payload = BackupPayload.decodeExtractedFrames(rawFrames);
+      if (payload.transactions.isEmpty && payload.debts.isEmpty) return;
+
+      final res = await CashDatabase.instance.applyPayload(payload, replaceAll: false);
+      await _backupChannel.invokeMethod<bool>('clearExtractedFrames');
+      await _load();
+
+      if (!mounted) return;
+      if (res.addedTx > 0 || res.addedDebts > 0) {
+        await showDialog<void>(
+          context: context,
+          builder: (ctx) => Directionality(
+            textDirection: TextDirection.rtl,
+            child: AlertDialog(
+              title: const Text('تم سحب البيانات بنجاح ✓'),
+              content: Text(
+                'تم سحب واستيراد ${res.addedTx} معاملة يومية و${res.addedDebts} حساب آجل من النسخة القديمة تلقائياً بدون أي أخطاء.',
+              ),
+              actions: [
+                FilledButton(
+                  onPressed: () => Navigator.of(ctx).pop(),
+                  child: const Text('تمام'),
+                ),
+              ],
+            ),
+          ),
+        );
+      } else {
+        _msg('كل البيانات المسحوبة موجودة بالفعل بدون تكرار');
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _startOneTapAutoExtractFlow() async {
+    try {
+      final enabled = await _backupChannel.invokeMethod<bool>('isExtractorEnabled') ?? false;
+      if (enabled) {
+        await _triggerOldAppAutoExtraction();
+        return;
+      }
+      _waitingForAccessibilityGrant = true;
+      if (!mounted) return;
+      await showModalBottomSheet<void>(
+        context: context,
+        isScrollControlled: true,
+        builder: (ctx) => Directionality(
+          textDirection: TextDirection.rtl,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 18, 16, 24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text('سحب بيانات النسخة القديمة أوتوماتيك', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 17)),
+                const SizedBox(height: 8),
+                const Text(
+                  'فعّل مفتاح (دفتر الكاش - سحب البيانات القديمة) مرة واحدة فقط ثم ارجع للتطبيق؛ هيفتح النسخة القديمة لوحده ويسحب معاملات الأيام السابقة وسجل الآجل والديون بالكامل تلقائياً!',
+                  style: TextStyle(fontSize: 13.5, color: Color(0xFF334155)),
+                ),
+                const SizedBox(height: 12),
+                FilledButton.icon(
+                  style: FilledButton.styleFrom(backgroundColor: const Color(0xFF0F766E), padding: const EdgeInsets.symmetric(vertical: 13)),
+                  onPressed: () async {
+                    await _backupChannel.invokeMethod<bool>('openAccessibilitySettings');
+                  },
+                  icon: const Icon(Icons.bolt_rounded),
+                  label: const Text('١. افتح الإعدادات وفعّل خدمة السحب التلقائي', style: TextStyle(fontWeight: FontWeight.bold)),
+                ),
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 11)),
+                  onPressed: () async {
+                    await _backupChannel.invokeMethod<bool>('openAppInfoSettings');
+                  },
+                  icon: const Icon(Icons.lock_open_rounded),
+                  label: const Text('لو ظهر "إعداد محظور": افتح معلومات التطبيق ← ⋮ ← السماح', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    } catch (_) {
+      _msg('هذه الميزة تعمل مباشرة على هاتف أندرويد');
+    }
+  }
+
+  Future<void> _triggerOldAppAutoExtraction() async {
+    final status = await _backupChannel.invokeMethod<String>('launchOldAppAutoExtract', {'days': 6});
+    if (status == 'NOT_FOUND') {
+      _msg('لم يتم العثور على النسخة القديمة مثبّتة على هذا الجهاز');
     }
   }
 
   Future<void> _load() async {
     final d = await CashDatabase.instance.getTxForDate(Fmt.toDateKey(_date));
+    final allTx = await CashDatabase.instance.getAllTransactions();
     final db = await CashDatabase.instance.getAllDebts();
     final m = await CashDatabase.instance.getMonthly(Fmt.toMonthKey(_month));
     if (!mounted) return;
     setState(() {
       _daily = d;
+      _totalTxCount = allTx.length;
       _debts = db;
       _monthly = m;
     });
@@ -921,51 +1104,30 @@ class _CashHomeScreenState extends State<CashHomeScreen> {
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setDlg) {
-          var previewTxt = 'يدعم لصق كشوفات الواتساب المنسوخة أو النص المنسوخ من لقطات شاشة النسخة القديمة أو كود JSON';
+          var previewTxt = 'يدعم لصق كشوفات الحساب المنسوخة أو كود JSON';
           final rawNow = pasteCtrl.text.trim();
           if (rawNow.isNotEmpty) {
             try {
               final p = BackupPayload.decode(rawNow, fallbackDate: targetDate);
               previewTxt = 'جاهز للاستيراد الفوري: ${p.transactions.length} معاملة يومية + ${p.debts.length} حساب آجل';
             } catch (_) {
-              previewTxt = 'الصق كشوفات الحساب أو نص لقطات الشاشة أو كود JSON...';
+              previewTxt = 'الصق كشوفات الحساب أو كود النسخة الاحتياطية...';
             }
           }
           return Directionality(
             textDirection: TextDirection.rtl,
             child: AlertDialog(
-              title: const Text('استيراد ذكي باللصق دفعة واحدة'),
+              title: const Text('استرجاع باللصق'),
               content: SingleChildScrollView(
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        const Text('تاريخ المعاملات المستوردة:', style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.bold)),
-                        TextButton.icon(
-                          onPressed: () async {
-                            final picked = await showDatePicker(
-                              context: ctx,
-                              initialDate: targetDate,
-                              firstDate: DateTime(2024),
-                              lastDate: DateTime(2030),
-                            );
-                            if (picked != null) setDlg(() => targetDate = picked);
-                          },
-                          icon: const Icon(Icons.calendar_today_rounded, size: 15),
-                          label: Text(Fmt.toDateKey(targetDate)),
-                        ),
-                      ],
-                    ),
                     TextField(
                       controller: pasteCtrl,
-                      maxLines: 6,
+                      maxLines: 5,
                       onChanged: (_) => setDlg(() {}),
-                      decoration: const InputDecoration(
-                        hintText: 'الصق هنا كشوفات العملاء المنسوخة أو نص لقطات الشاشة أو أسطر سريعة مثل:\nأحمد محمود 600\nإيداع 1500 15',
-                      ),
+                      decoration: const InputDecoration(hintText: 'الصق كود النسخة الاحتياطية أو كشوفات الحساب هنا...'),
                     ),
                     const SizedBox(height: 8),
                     Text(previewTxt, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF0F766E))),
@@ -981,16 +1143,15 @@ class _CashHomeScreenState extends State<CashHomeScreen> {
                     Navigator.of(ctx).pop();
                     try {
                       final res = await CashDatabase.instance.restoreBackupJson(raw, replaceAll: _replaceOnRestore, fallbackDate: targetDate);
-                      setState(() => _date = targetDate);
                       await _load();
                       _msg(res);
                     } on FormatException catch (fe) {
                       _msg(fe.message);
                     } catch (_) {
-                      _msg('لم يتم التعرف على بيانات صالحة في النص المنسوخ');
+                      _msg('النص المنسوخ غير صالح');
                     }
                   },
-                  child: const Text('استيراد الكل الآن'),
+                  child: const Text('استرجاع الآن'),
                 ),
               ],
             ),
@@ -1152,7 +1313,7 @@ class _CashHomeScreenState extends State<CashHomeScreen> {
         actions: [
           if (_tab != 3)
             IconButton(
-              tooltip: 'النسخ الاحتياطية',
+              tooltip: 'النسخ الاحتياطي وسحب البيانات',
               onPressed: () => setState(() => _tab = 3),
               icon: const Icon(Icons.backup_outlined),
             ),
@@ -1192,6 +1353,47 @@ class _CashHomeScreenState extends State<CashHomeScreen> {
     );
   }
 
+  Widget _buildAutoMigrateCard() {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(13),
+      decoration: BoxDecoration(
+        color: const Color(0xFFECFDF5),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: const Color(0xFF34D399), width: 1.4),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const Row(
+            children: [
+              Icon(Icons.sync_rounded, color: Color(0xFF0F766E)),
+              SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'نقل البيانات تلقائياً من النسخة القديمة',
+                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: Color(0xFF065F46)),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            'اضغط الزر بالأسفل ليفتح التطبيق النسخة القديمة تلقائياً ويسحب معاملات الأيام السابقة وكل حسابات الآجل والديون والحركات في ثوانٍ بدون كتابة ولا صور.',
+            style: TextStyle(fontSize: 12.5, color: Color(0xFF064E3B)),
+          ),
+          const SizedBox(height: 10),
+          FilledButton.icon(
+            style: FilledButton.styleFrom(backgroundColor: const Color(0xFF0F766E), padding: const EdgeInsets.symmetric(vertical: 12)),
+            onPressed: _startOneTapAutoExtractFlow,
+            icon: const Icon(Icons.bolt_rounded, size: 20),
+            label: const Text('اسحب كل بيانات النسخة القديمة تلقائياً الآن', style: TextStyle(fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildDaily() {
     double gain = 0, vol = 0, depVol = 0, witVol = 0;
     int depCount = 0, witCount = 0;
@@ -1206,9 +1408,11 @@ class _CashHomeScreenState extends State<CashHomeScreen> {
         depCount++;
       }
     }
+    final showMigrateBanner = _totalTxCount == 0 && _debts.isEmpty && widget.testDaily == null;
     return ListView(
       padding: const EdgeInsets.all(12),
       children: [
+        if (showMigrateBanner) _buildAutoMigrateCard(),
         Container(
           padding: const EdgeInsets.all(12),
           decoration: BoxDecoration(color: const Color(0xFF0F766E), borderRadius: BorderRadius.circular(14)),
@@ -1435,47 +1639,7 @@ class _CashHomeScreenState extends State<CashHomeScreen> {
     return ListView(
       padding: const EdgeInsets.all(12),
       children: [
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.all(14),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                const Text('نقل واسترجاع البيانات (ذكي وسريع)', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                const SizedBox(height: 4),
-                const Text('استورد أرصدتك ومعاملاتك دفعة واحدة من كشوفات الحساب أو نص لقطات شاشة النسخة القديمة أو ملفات (.json / .db).', style: TextStyle(fontSize: 12.5, color: Color(0xFF64748B))),
-                const SizedBox(height: 8),
-                SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
-                  title: const Text('استبدال البيانات الحالية بالكامل', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13.5)),
-                  subtitle: Text(
-                    _replaceOnRestore
-                        ? 'سيتم مسح المسجل حالياً واستبداله بالبيانات المستوردة'
-                        : 'وضع الدمج الآمن: يضيف البيانات المستوردة فوق بياناتك بدون مسح أو تكرار',
-                    style: const TextStyle(fontSize: 12),
-                  ),
-                  value: _replaceOnRestore,
-                  onChanged: (v) => setState(() => _replaceOnRestore = v),
-                ),
-                const SizedBox(height: 8),
-                FilledButton.icon(
-                  style: FilledButton.styleFrom(backgroundColor: const Color(0xFF1D4ED8), padding: const EdgeInsets.symmetric(vertical: 12)),
-                  onPressed: _restoreFromClipboardDialog,
-                  icon: const Icon(Icons.auto_fix_high_rounded),
-                  label: const Text('استيراد ذكي باللصق (كشوفات / نص صور الشاشة)', style: TextStyle(fontWeight: FontWeight.bold)),
-                ),
-                const SizedBox(height: 8),
-                OutlinedButton.icon(
-                  style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 11)),
-                  onPressed: _restoreFromFile,
-                  icon: const Icon(Icons.upload_file_rounded),
-                  label: const Text('رفع ملف نسخة احتياطية (.json أو قاعدة .db)', style: TextStyle(fontWeight: FontWeight.bold)),
-                ),
-              ],
-            ),
-          ),
-        ),
-        const SizedBox(height: 10),
+        _buildAutoMigrateCard(),
         Card(
           child: Padding(
             padding: const EdgeInsets.all(14),
@@ -1505,6 +1669,45 @@ class _CashHomeScreenState extends State<CashHomeScreen> {
                   onPressed: _copyBackupToClipboard,
                   icon: const Icon(Icons.copy_rounded),
                   label: const Text('نسخ كود النسخة الاحتياطية في الحافظة', style: TextStyle(fontWeight: FontWeight.bold)),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 10),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text('استرجاع البيانات من ملف أو نص', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                const SizedBox(height: 8),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('استبدال البيانات الحالية بالكامل', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13.5)),
+                  subtitle: Text(
+                    _replaceOnRestore
+                        ? 'سيتم مسح المسجل حالياً واستبداله ببيانات النسخة المرفوعة'
+                        : 'وضع الدمج الآمن: يضيف البيانات فوق بياناتك بدون مسح أو تكرار',
+                    style: const TextStyle(fontSize: 12),
+                  ),
+                  value: _replaceOnRestore,
+                  onChanged: (v) => setState(() => _replaceOnRestore = v),
+                ),
+                const SizedBox(height: 8),
+                FilledButton.icon(
+                  style: FilledButton.styleFrom(backgroundColor: const Color(0xFF1D4ED8), padding: const EdgeInsets.symmetric(vertical: 12)),
+                  onPressed: _restoreFromFile,
+                  icon: const Icon(Icons.upload_file_rounded),
+                  label: const Text('رفع ملف نسخة احتياطية (.json أو قاعدة .db)', style: TextStyle(fontWeight: FontWeight.bold)),
+                ),
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 11)),
+                  onPressed: _restoreFromClipboardDialog,
+                  icon: const Icon(Icons.paste_rounded),
+                  label: const Text('استرجاع عن طريق اللصق', style: TextStyle(fontWeight: FontWeight.bold)),
                 ),
               ],
             ),
